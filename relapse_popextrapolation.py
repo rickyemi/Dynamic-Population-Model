@@ -1,0 +1,2036 @@
+#!/usr/bin/env python3
+"""Relapse Calculation and Population Extrapolation, Dynamic Population Model.
+
+Two independent workflows, generated from the companion notebook
+``notebooks/Relapse_Calculation_and_PopExtrapolation.ipynb`` so that the two cannot drift apart.
+
+Workflow 1, relapse calculation
+    Reads the ``Detailed Results ALL.T DIFF_ALL`` tab of a DPM export, rebuilds the two pivot
+    tables and every derived column, and writes them back as the ``Pivot and Calcs`` and
+    ``Detailed Results`` tabs of a new workbook. That workbook is input 2 of Workflow 2.
+
+Workflow 2, population extrapolation
+    Reads the parameters and births workbook together with the Workflow 1 output, extrapolates the
+    model results from the simulated cohort to the real population, and writes a four tab results
+    workbook: a metadata cover sheet, all results, the relapse arm, and the no relapse arm with the
+    comparison columns.
+
+The two workflows communicate through a file on disk rather than through Python objects, which is
+what keeps them independent: either can be run on its own, and Workflow 2 can be pointed at a
+workbook produced weeks earlier.
+
+Usage
+-----
+    python relapse_popextrapolation.py --workflow 1 --dir "C:/path/to/exports"
+    python relapse_popextrapolation.py --workflow 2 --dir "C:/path/to/exports"
+    python relapse_popextrapolation.py --workflow both --dir "C:/path/to/exports"
+    python relapse_popextrapolation.py --self-test          # no real exports needed
+
+Every default can be overridden on the command line; see ``--help``. Run with no arguments to use
+the defaults in the CONFIGURATION section below, which is the equivalent of running the notebook
+top to bottom.
+
+Author: YO
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import platform
+import re
+import sys
+import textwrap
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+pd.set_option("display.width", 220)
+pd.set_option("display.max_columns", 40)
+
+
+# ================================================================================================
+# RELAPSE CALCULATION AND POPULATION EXTRAPOLATION
+# ================================================================================================
+#
+# Two independent workflows in one notebook. Each has its own imports, its own configuration
+# cell
+# and its own mock data test, so either can be run on its own from a fresh kernel. Workflow 1
+# hands
+# its output workbook to Workflow 2 as a file, not as a Python object, which is what keeps them
+# independent.
+#
+# ```
+# Workflow 1                                        Workflow 2
+# DetailedModelResults_<source>.xlsx                PopExtractionInputs_GT.xlsx
+#         |                                                 |
+#         v                                                 v
+#   Pivot and Calcs  +  Detailed Results  ---->  DetailedModelResults_Relapse_Calculations.xlsx
+#                                                           |
+#                                                           v
+#                                     PopExtrapolationRes_<Product>_<Date>_<Time>.xlsx
+# ```
+#
+
+# ================================================================================================
+# WORKFLOW 1, RELAPSE CALCULATION AND PIVOT AND CALCS
+# ================================================================================================
+#
+# Reads the `Detailed Results ALL.T DIFF_ALL` tab, rebuilds the two pivot tables and every
+# derived
+# column, and writes them back into the workbook as the `Pivot and Calcs` and `Detailed Results`
+# tabs, saving the result as `DetailedModelResults_Relapse_Calculations.xlsx`.
+#
+# | Item | Detail |
+# |---|---|
+# | Input | `DetailedModelResults_<source>.xlsx`, tab `Detailed Results ALL.T DIFF_ALL` |
+# | Output | `DetailedModelResults_Relapse_Calculations.xlsx`, original tab preserved, plus `Pivot and Calcs` and `Detailed Results` |
+# | Sections | W1.0 to W1.9 |
+#
+
+# ================================================================================================
+# WORKFLOW 2, POPULATION EXTRAPOLATION
+# ================================================================================================
+#
+# Reads the two input workbooks, extrapolates the model output to the real population, and
+# writes
+# the four tab results workbook.
+#
+# | Item | Detail |
+# |---|---|
+# | Input 1 | `PopExtractionInputs_GT.xlsx`, tabs `Parameters` and `Births` |
+# | Input 2 | `DetailedModelResults_Relapse_Calculations.xlsx`, tab `Detailed Results` |
+# | Output | `PopExtrapolationRes_<Product>_<DDMonYYYY>_<HHMMSS>.xlsx` |
+# | Output tabs | `Metadata`, `Results from Python`, `Relapse`, `No Relapse and final Results` |
+# | Sections | W2.0 to W2.17 |
+#
+# The product name is read out of the `Model Group` column of input 2, so `Product_Name YO`
+# gives
+# `Product_Name`. Matching is whitespace agnostic, `Product_Name`, `product name` and
+# `ProductName`
+# are all treated as the same product.
+#
+
+# ================================================================================================
+# FORMULA REFERENCE, REPLICATED FROM THE SOURCE WORKBOOK
+# ================================================================================================
+#
+# Every rule below is written into the output workbook as a live Excel formula, so the sheet
+# recalculates in Excel exactly as the hand built version did. The same rules are also evaluated
+# in
+# pandas, and the two are cross checked before the file is written.
+#
+# | Sheet | Cell | Formula | Meaning |
+# |---|---|---|---|
+# | Pivot and Calcs | `A5` | `=G5&F5&E5` | Relapse Key, model name and ERR and mortality model |
+# | Pivot and Calcs | `B5` | `=IF(ISNUMBER(SEARCH("G10",G5)),"G10","G25")` | Gateway |
+# | Pivot and Calcs | `C5` | `=IF(ISNUMBER(SEARCH("AllAge",G5)),"AllAge","TwoAge")` | Stacked Type |
+# | Pivot and Calcs | `D5` | `=RIGHT(G5,3)` | Birth Cohort |
+# | Pivot and Calcs | `J5`, `K5`, `L5` | the same three rules applied to `O5` | Master model side |
+# | Pivot and Calcs | `S5` | `=ROUND(P5-H5,0)` | `(CF1-CF2)`, difference, survivors no relapse against survivors 50% relapse |
+# | Pivot and Calcs | `T5` | `=ROUND(Q5-S5,0)` | `CF1-BC1-CF1+CF2`, adjusted results, DIFF_ALL |
+# | Pivot and Calcs | `V5:Y5` | `=EXACT(B5,J5)` and so on | Check if rows match between Relapse and Master Pivot Tables |
+# | Detailed Results | `J3` | `=B3&D3&C3` | Key |
+# | Detailed Results | `L3` | `=ROUND(IF(ISNUMBER(SEARCH("Relapse",J3)),XLOOKUP(J3,'Pivot and Calcs'!A:A,'Pivot and Calcs'!T:T),I3),0)` | QC, the live version of the `Mean` rule |
+#
+# Two deliberate departures from the source workbook, both switchable in Section W1.0:
+#
+# 1. Column `V` in the source referenced the row below (`V5` held `=EXACT(B6,J6)`) while `W`, `X` and
+#    `Y` were aligned. That is a fill handle artefact, so `V` is written aligned. Set
+#    `W1_REPLICATE_V_OFFSET = True` to reproduce the original offset.
+# 2. Column `K` (`Mean`) is written as a computed value rather than a formula, because Workflow 2
+#    reads this column with pandas and an uncalculated formula reads back as empty. The
+# identical
+#    rule is written as a live formula in column `L` (`QC`), so opening the file in Excel gives
+# an
+#    automatic check of the Python value against the Excel formula. Set `W1_MEAN_AS_FORMULA =
+# True`
+#    to write the formula in both.
+# 3. Survivor counts are whole people, so `ALL.T`, `DIFF_ALL`, `(CF1-CF2)` and the adjusted results
+#    on `Pivot and Calcs`, and `Mean_Webtool`, `Mean` and `QC` on `Detailed Results`, are
+# rounded to
+#    whole numbers rather than only displayed that way. The rounding happens in the pandas frame
+# and
+#    in the Excel formula together, `=ROUND(P5-H5,0)` rather than `=(P5-H5)`, so the sheet
+#    recalculates to exactly what the frame holds. Set `W1_WHOLE_NUMBERS = False` to keep full
+#    precision. Worth knowing: `Mean` is the column Workflow 2 reads, so rounding it moves the
+#    extrapolated totals by a fraction of a case; Section W2.16 prints the totals, and the shift
+# is
+#    far below the precision the model output supports.
+# 4. The four `EXACT()` alignment checks in columns `V` to `Y` are colour coded, green for `TRUE` and
+#    red for `FALSE`, through conditional formatting rather than fixed fills. The cells hold
+#    formulas, so openpyxl cannot know their result at write time, and a rule keeps the colour
+#    correct if anyone edits the sheet afterwards.
+
+
+# ================================================================================================
+# WORKFLOW 1, RELAPSE CALCULATION AND PIVOT AND CALCS
+# ================================================================================================
+#
+
+# ================================================================================================
+# SECTION W1.0. IMPORTS AND CONSTANTS
+# ================================================================================================
+#
+# Everything Workflow 1 needs. Nothing here is shared with Workflow 2, the two can run in either
+# order or on their own.
+
+# ------------------------------------------------------------------- sheets
+W1_SOURCE_SHEET = "Detailed Results ALL.T DIFF_ALL"   # tab the workflow reads
+W1_PIVOT_SHEET = "Pivot and Calcs"                    # tab the workflow writes
+W1_DETAIL_SHEET = "Detailed Results"                  # tab the workflow writes
+W1_TITLE = "Detailed Model Results"                   # cell A1 of the detail tabs
+
+# --------------------------------------------------------------- pivot rules
+W1_RELAPSE_TOKEN = "Relapse"     # a model is a relapse model when its name contains this
+W1_NODE_TOTAL = "ALL.T"          # node holding the survivor count
+W1_NODE_DIFF = "DIFF_ALL"        # node holding the difference
+W1_PIVOT_KEYS = ["Mortality Model", "ERR", "Model Name"]                      # pivot row fields
+W1_JOIN_KEYS = ["Mortality Model", "ERR", "Gateway", "Stacked Type", "Birth Cohort"]
+
+# Row where each written sheet starts, matching the hand built workbook
+W1_PIVOT_HEADER_ROW = 4          # 2 and 3 hold the block labels, 4 holds the column headers
+W1_PIVOT_FIRST_ROW = 5
+W1_DETAIL_HEADER_ROW = 2         # 1 holds the title
+W1_DETAIL_FIRST_ROW = 3
+
+# See the overview for both of these
+W1_REPLICATE_V_OFFSET = False    # True reproduces the source workbook's off by one column V
+W1_MEAN_AS_FORMULA = False       # True writes column K as a formula instead of a value
+
+# Survivor counts are whole people, so the count columns are rounded to whole numbers rather than
+# only being displayed that way: ALL.T, DIFF_ALL, (CF1-CF2) and the adjusted results on
+# 'Pivot and Calcs', and Mean_Webtool, Mean and QC on 'Detailed Results'. The live Excel formulas
+# are wrapped in ROUND() to match, so the sheet recalculates to the same whole numbers.
+# Set to False to keep full precision and round on display only.
+W1_WHOLE_NUMBERS = True
+W1_COUNT_FORMAT = "#,##0"        # display format for every count column
+
+# ------------------------------------------------------------------- styling
+W1_FONT = "Calibri"
+W1_FONT_SIZE = 11
+W1_HEADER_FILL = "0070C0"        # blue, column headers on Pivot and Calcs
+W1_BLOCK_FILL = "00B050"         # green, the two pivot block labels
+W1_ADJUSTED_FILL = "FFFF00"      # yellow, the adjusted results column
+W1_DETAIL_HEADER_FILL = "D9D9D9" # grey, column headers on Detailed Results
+W1_TRUE_FILL = "C6EFCE"          # green, a passing EXACT() row alignment check
+W1_TRUE_FONT = "006100"
+W1_FALSE_FILL = "FFC7CE"         # red, a failing one
+W1_FALSE_FONT = "9C0006"
+
+pd.set_option("display.width", 220)
+pd.set_option("display.max_columns", 40)
+
+print(f"Workflow 1 ready | pandas {pd.__version__} | numpy {np.__version__}")
+
+
+# ================================================================================================
+# SECTION W1.1. CONFIGURATION
+# ================================================================================================
+#
+# `W1_INPUT_FILE` is the workbook holding the `Detailed Results ALL.T DIFF_ALL` tab. The output
+# keeps
+# every sheet of that workbook and adds, or replaces, the two generated tabs.
+
+
+# ================================================================================================
+# SECTION W1.2. READ THE SOURCE TAB
+# ================================================================================================
+#
+# The export puts a title in row 1 and the real header in row 2, so the header row is located by
+# looking for the cell that reads `Model Group` rather than assuming a fixed offset. `Mean` and
+# `ERR`
+# are coerced to numbers because a shifted header leaves them stored as text.
+#
+# `excel_text` matters more than it looks. The `Relapse Key` is built by Excel's `&` operator,
+# which
+# formats a number the way the General format would: `0.05` stays `0.05` and `0.1` stays `0.1`,
+# not
+# `0.10`. `f"{v:g}"` reproduces that, and the keys have to agree exactly or the lookup in the
+# `Detailed Results` tab silently misses.
+
+def excel_text(v) -> str:
+    """Format a value the way Excel's & operator would, so keys match character for character."""
+    if v is None or (isinstance(v, float) and np.isnan(v)) or v is pd.NA:
+        return ""
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    if isinstance(v, (float, np.floating)):
+        return f"{v:g}"          # 0.05 -> '0.05', 0.1 -> '0.1'
+    return str(v)
+
+
+def w1_read_source(path, sheet: str = W1_SOURCE_SHEET) -> pd.DataFrame:
+    """Read the detailed model results tab, header row found rather than assumed."""
+    raw = pd.read_excel(path, sheet_name=sheet, header=None, dtype=object)
+    first_col = raw.iloc[:, 0].astype(str).str.strip()
+    hdr = np.flatnonzero(first_col.values == "Model Group")
+
+    if hdr.size:
+        i = int(hdr[0])
+        df = raw.iloc[i + 1:].copy()
+        df.columns = [str(c).strip() for c in raw.iloc[i]]
+    else:
+        df = pd.read_excel(path, sheet_name=sheet, dtype=object)
+        df.columns = [str(c).strip() for c in df.columns]
+
+    df = df.reset_index(drop=True)
+    df = df.loc[df["Model Group"].notna()]                                   # blank spacer rows
+    df = df.loc[df["Model Group"].astype(str).str.strip() != "Model Group"]  # repeated headers
+    df = df.dropna(axis=1, how="all")
+
+    for need in ("Model Group", "Model Name", "Mortality Model", "ERR", "Node", "Mean"):
+        if need not in df.columns:
+            raise KeyError(f"Sheet '{sheet}' is missing the required column '{need}'.")
+
+    df["Mean"] = pd.to_numeric(df["Mean"], errors="coerce")
+    df["ERR"] = pd.to_numeric(df["ERR"], errors="coerce")
+    for c in ("Model Group", "Model Name", "Mortality Model", "Node"):
+        df[c] = df[c].astype(str).str.strip()
+
+    nodes = set(df["Node"].unique())
+    for node in (W1_NODE_TOTAL, W1_NODE_DIFF):
+        if node not in nodes:
+            warnings.warn(f"Node '{node}' not present in '{sheet}', found {sorted(nodes)}.")
+
+    return df.reset_index(drop=True)
+
+
+# ================================================================================================
+# SECTION W1.3. THE TWO PIVOT TABLES
+# ================================================================================================
+#
+# The left block of `Pivot and Calcs` is a pivot of the relapse models, rows `Mortality Model`,
+# `ERR`,
+# `Model Name`, value `Max of Mean` filtered to the `ALL.T` node. The right block is the same
+# pivot of
+# the master models, with `Max of Mean` for both `ALL.T` and `DIFF_ALL`.
+#
+# `max` is used rather than `sum` or `mean` because that is what the source pivot used. With one
+# row
+# per model, node, mortality model and ERR it makes no numerical difference, but it does mean a
+# duplicated export row cannot inflate a total.
+#
+# The three derived fields are computed here as well as being written as formulas, since they
+# are
+# needed to line the two blocks up:
+#
+# * Gateway, `G10` when the model name contains `G10`, otherwise `G25`
+# * Stacked Type, `AllAge` when the name contains `AllAge`, otherwise `TwoAge`
+# * Birth Cohort, the last three characters of the name, for example `B01`
+
+def w1_gateway(names: pd.Series) -> np.ndarray:
+    """=IF(ISNUMBER(SEARCH("G10",G5)),"G10","G25")"""
+    return np.where(names.str.contains("G10", case=False, regex=False), "G10", "G25")
+
+
+def w1_stacked_type(names: pd.Series) -> np.ndarray:
+    """=IF(ISNUMBER(SEARCH("AllAge",G5)),"AllAge","TwoAge")"""
+    return np.where(names.str.contains("AllAge", case=False, regex=False), "AllAge", "TwoAge")
+
+
+def w1_birth_cohort(names: pd.Series) -> pd.Series:
+    """=RIGHT(G5,3)"""
+    return names.str[-3:]
+
+
+def w1_add_derived(frame: pd.DataFrame, name_col: str = "Model Name") -> pd.DataFrame:
+    """Attach Gateway, Stacked Type and Birth Cohort to a pivot side."""
+    frame = frame.copy()
+    frame["Gateway"] = w1_gateway(frame[name_col])
+    frame["Stacked Type"] = w1_stacked_type(frame[name_col])
+    frame["Birth Cohort"] = w1_birth_cohort(frame[name_col])
+    return frame
+
+
+def w1_build_pivots(src: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return the relapse pivot and the master model pivot, both with derived fields."""
+    is_relapse = src["Model Name"].str.contains(W1_RELAPSE_TOKEN, case=False, regex=False)
+    if not is_relapse.any():
+        raise ValueError(f"No model names contain '{W1_RELAPSE_TOKEN}', so no relapse pivot can be built.")
+    if is_relapse.all():
+        raise ValueError(f"Every model name contains '{W1_RELAPSE_TOKEN}', so no master pivot can be built.")
+
+    relapse = (src.loc[is_relapse & (src["Node"] == W1_NODE_TOTAL)]
+                  .groupby(W1_PIVOT_KEYS, as_index=False)["Mean"].max()
+                  .rename(columns={"Mean": W1_NODE_TOTAL}))
+
+    master = (src.loc[~is_relapse & src["Node"].isin([W1_NODE_TOTAL, W1_NODE_DIFF])]
+                 .pivot_table(index=W1_PIVOT_KEYS, columns="Node", values="Mean", aggfunc="max")
+                 .reset_index())
+    master.columns.name = None
+    for node in (W1_NODE_TOTAL, W1_NODE_DIFF):
+        if node not in master.columns:
+            raise ValueError(f"The master model pivot has no '{node}' column.")
+
+    return w1_add_derived(relapse), w1_add_derived(master)
+
+
+# ================================================================================================
+# SECTION W1.4. ALIGN THE BLOCKS AND APPLY THE CALCS
+# ================================================================================================
+#
+# The two blocks sit side by side row for row, so each relapse model has to be paired with the
+# master
+# model built on the same gateway, stacked type, birth cohort, mortality model and ERR. The
+# model
+# names differ (`..._Relapse_TwoAge_B01` against `..._TwoAge_5a_6a_14b_15a_B01`), so the join
+# runs on
+# those five fields rather than on the name. Both sides are checked for duplicate keys first,
+# since a
+# duplicate would fan the join out and quietly shift every row below it.
+#
+# ```
+# (CF1-CF2)         S = master ALL.T - relapse ALL.T
+# CF1-BC1-CF1+CF2   T = master DIFF_ALL - S
+# ```
+#
+# The `EXACT` columns are the built in check that the two blocks stayed aligned. They are
+# computed
+# here as well as written as formulas, and a mismatch raises rather than being left for someone
+# to
+# spot in the sheet.
+
+W1_PIVOT_COLUMNS = [
+    "Relapse Key", "Gateway", "Stacked Type", "Birth Cohort", "Mortality Model", "ERR",
+    "Model Name", W1_NODE_TOTAL,                                     # A to H, relapse block
+    "Gateway_m", "Stacked Type_m", "Birth Cohort_m", "Mortality Model_m", "ERR_m",
+    "Model Name_m", f"{W1_NODE_TOTAL}_m", f"{W1_NODE_DIFF}_m",       # J to Q, master block
+    "(CF1-CF2)", "CF1-BC1-CF1+CF2",                                  # S and T
+    "Check Gateway", "Check StackedType", "Check Birth Cohort", "Check Mortality Model",  # V to Y
+]
+
+
+def w1_build_pivot_sheet(relapse: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
+    """Join the two pivot blocks row for row and apply the two calc columns."""
+    for label, frame in (("Relapse", relapse), ("Master", master)):
+        dup = frame.duplicated(subset=W1_JOIN_KEYS, keep=False)
+        if dup.any():
+            offenders = frame.loc[dup, W1_JOIN_KEYS + ["Model Name"]]
+            raise ValueError(f"The {label} pivot has more than one row per {W1_JOIN_KEYS}:\n"
+                             f"{offenders.to_string(index=False)}")
+
+    merged = relapse.merge(master, on=W1_JOIN_KEYS, how="outer",
+                           suffixes=("", "_mas"), indicator=True)
+    if (merged["_merge"] != "both").any():
+        orphans = merged.loc[merged["_merge"] != "both", W1_JOIN_KEYS + ["_merge"]]
+        warnings.warn(f"{len(orphans)} pivot row(s) exist on one side only, their calcs will be "
+                      f"blank:\n{orphans.to_string(index=False)}")
+    merged = merged.drop(columns="_merge")
+
+    out = pd.DataFrame({
+        # A to H, the relapse block
+        "Relapse Key": (merged["Model Name"].map(excel_text)      # =G5&F5&E5
+                        + merged["ERR"].map(excel_text)
+                        + merged["Mortality Model"].map(excel_text)),
+        "Gateway": merged["Gateway"],
+        "Stacked Type": merged["Stacked Type"],
+        "Birth Cohort": merged["Birth Cohort"],
+        "Mortality Model": merged["Mortality Model"],
+        "ERR": merged["ERR"],
+        "Model Name": merged["Model Name"],
+        W1_NODE_TOTAL: merged[W1_NODE_TOTAL],
+        # J to Q, the master block. The join fields are shared, so they repeat by construction
+        "Gateway_m": merged["Gateway"],
+        "Stacked Type_m": merged["Stacked Type"],
+        "Birth Cohort_m": merged["Birth Cohort"],
+        "Mortality Model_m": merged["Mortality Model"],
+        "ERR_m": merged["ERR"],
+        "Model Name_m": merged["Model Name_mas"],
+        f"{W1_NODE_TOTAL}_m": merged[f"{W1_NODE_TOTAL}_mas"],
+        f"{W1_NODE_DIFF}_m": merged[W1_NODE_DIFF],
+    })
+
+    out["(CF1-CF2)"] = out[f"{W1_NODE_TOTAL}_m"] - out[W1_NODE_TOTAL]      # =(P5-H5)
+    out["CF1-BC1-CF1+CF2"] = out[f"{W1_NODE_DIFF}_m"] - out["(CF1-CF2)"]   # =(Q5-S5)
+
+    if W1_WHOLE_NUMBERS:
+        # Rounded here as well as in the sheet, so the frame, the written cells and the lookup
+        # that feeds 'Detailed Results' all carry the same whole numbers. The two pivot columns
+        # are rounded before the subtraction, exactly as the sheet does it.
+        for col in (W1_NODE_TOTAL, f"{W1_NODE_TOTAL}_m", f"{W1_NODE_DIFF}_m"):
+            out[col] = out[col].round(0)
+        out["(CF1-CF2)"] = (out[f"{W1_NODE_TOTAL}_m"] - out[W1_NODE_TOTAL]).round(0)
+        out["CF1-BC1-CF1+CF2"] = (out[f"{W1_NODE_DIFF}_m"] - out["(CF1-CF2)"]).round(0)
+
+    # =EXACT(B5,J5) and the three like it
+    out["Check Gateway"] = out["Gateway"] == out["Gateway_m"]
+    out["Check StackedType"] = out["Stacked Type"] == out["Stacked Type_m"]
+    out["Check Birth Cohort"] = out["Birth Cohort"] == out["Birth Cohort_m"]
+    out["Check Mortality Model"] = out["Mortality Model"] == out["Mortality Model_m"]
+
+    checks = ["Check Gateway", "Check StackedType", "Check Birth Cohort", "Check Mortality Model"]
+    if not out[checks].all().all():
+        bad = out.loc[~out[checks].all(axis=1), W1_JOIN_KEYS + checks]
+        raise ValueError("The relapse and master pivot rows do not line up:\n"
+                         f"{bad.to_string(index=False)}")
+
+    out = out.sort_values(["Mortality Model", "ERR", "Model Name"], kind="mergesort")
+    return out.loc[:, W1_PIVOT_COLUMNS].reset_index(drop=True)
+
+
+# ================================================================================================
+# SECTION W1.5. THE DETAILED RESULTS TAB
+# ================================================================================================
+#
+# One row per `DIFF_ALL` row of the source, in the source's own order, with four columns
+# inserted
+# after `Node`:
+#
+# * `Mean_Webtool`, the original webtool mean
+# * `Key`, `=B3&D3&C3`, model name and ERR and mortality model
+# * `Mean`, the relapse adjusted figure: for a relapse model, the `CF1-BC1-CF1+CF2` value looked up on
+#   `Key`, otherwise the webtool mean unchanged
+# * `QC`, the same rule again, written as a live Excel formula
+#
+# This `Mean` column is what Workflow 2 consumes.
+
+W1_DETAIL_FRONT = ["Model Group", "Model Name", "Mortality Model", "ERR", "ERR Variability",
+                   "TP Variability", "Age Range", "Node", "Mean_Webtool", "Key", "Mean", "QC"]
+W1_COUNT_COLUMNS = ("Mean_Webtool", "Mean", "QC")     # survivor counts, shown as whole numbers
+
+
+def w1_build_detail_sheet(src: pd.DataFrame, pivot: pd.DataFrame) -> pd.DataFrame:
+    """Rebuild the Detailed Results tab, with the relapse adjusted Mean column."""
+    det = src.loc[src["Node"] == W1_NODE_DIFF].copy().reset_index(drop=True)
+    if det.empty:
+        raise ValueError(f"No '{W1_NODE_DIFF}' rows in the source tab, the detail tab would be empty.")
+
+    det = det.rename(columns={"Mean": "Mean_Webtool"})
+    det["Key"] = (det["Model Name"].map(excel_text)          # =B3&D3&C3
+                  + det["ERR"].map(excel_text)
+                  + det["Mortality Model"].map(excel_text))
+
+    lookup = dict(zip(pivot["Relapse Key"], pivot["CF1-BC1-CF1+CF2"]))
+    is_relapse = det["Model Name"].str.contains(W1_RELAPSE_TOKEN, case=False, regex=False)
+
+    # =IF(ISNUMBER(SEARCH("Relapse",J3)),XLOOKUP(J3,'Pivot and Calcs'!A:A,'Pivot and Calcs'!T:T),I3)
+    det["Mean"] = np.where(is_relapse, det["Key"].map(lookup), det["Mean_Webtool"])
+    det["QC"] = det["Mean"]      # overwritten with the live formula when the sheet is written
+
+    if W1_WHOLE_NUMBERS:
+        # Whole survivors in the frame as well as in the sheet. 'Mean' is what Workflow 2 reads,
+        # so rounding it here is what makes the two agree.
+        for col in ("Mean_Webtool", "Mean", "QC"):
+            det[col] = pd.to_numeric(det[col], errors="coerce").round(0)
+
+    unmatched = int((is_relapse & ~det["Key"].isin(lookup)).sum())
+    if unmatched:
+        missing = det.loc[is_relapse & ~det["Key"].isin(lookup), "Key"].unique()[:5].tolist()
+        raise ValueError(f"{unmatched} relapse row(s) have no matching Relapse Key in the pivot, "
+                         f"so their Mean cannot be adjusted. Examples: {missing}")
+
+    front = [c for c in W1_DETAIL_FRONT if c in det.columns]
+    rest = [c for c in det.columns if c not in front]
+    return det.loc[:, front + rest]
+
+
+# ================================================================================================
+# SECTION W1.6. WRITE THE TWO TABS INTO THE WORKBOOK
+# ================================================================================================
+#
+# The input workbook is opened, the two generated tabs are dropped if they already exist, and
+# both are
+# rewritten from scratch with the live formulas. Every other sheet, including the source tab, is
+# carried through untouched, and the result is saved under the new name.
+#
+# Note the `_xlfn.` prefix on `XLOOKUP`. Functions newer than the 2007 file format have to be
+# written
+# that way for Excel to recognise them, though Excel displays them without the prefix once the
+# file is
+# open.
+
+def _w1_style(ws, row, col, value, *, bold=False, fill=None, number_format=None):
+    """Write one cell and style it in the same pass."""
+    cell = ws.cell(row=row, column=col, value=value)
+    cell.font = Font(name=W1_FONT, size=W1_FONT_SIZE, bold=bold)
+    if fill:
+        cell.fill = PatternFill("solid", fgColor=fill)
+    if number_format:
+        cell.number_format = number_format
+    return cell
+
+
+def w1_write_pivot_sheet(wb, pivot: pd.DataFrame) -> None:
+    """Write 'Pivot and Calcs' with the block labels, headers and live formulas."""
+    if W1_PIVOT_SHEET in wb.sheetnames:
+        del wb[W1_PIVOT_SHEET]
+    ws = wb.create_sheet(W1_PIVOT_SHEET)
+
+    # Row 2 and row 3, the block labels sitting above the two pivots
+    _w1_style(ws, 2, 7, "Relapse ALL.T", fill=W1_BLOCK_FILL)                       # G2
+    _w1_style(ws, 2, 15, "Master Model ALL.T and DIFF_ALL", fill=W1_BLOCK_FILL)    # O2
+    _w1_style(ws, 2, 16, "CF1")                                                    # P2
+    _w1_style(ws, 2, 17, "CF1-BC1")                                                # Q2
+    _w1_style(ws, 2, 22, "Check if rows match between Relapse and Master Pivot Tables")  # V2
+    _w1_style(ws, 3, 5, "Max of Mean")                                             # E3
+    _w1_style(ws, 3, 8, "Node")                                                    # H3
+    for col in range(13, 18):                                                      # M3 to Q3
+        _w1_style(ws, 3, col, {13: "Max of Mean", 16: "Node"}.get(col), fill=W1_HEADER_FILL)
+    _w1_style(ws, 3, 19, "(CF1-CF2)")                                              # S3
+    _w1_style(ws, 3, 20, "CF1-BC1-CF1+CF2")                                        # T3
+
+    # Row 4, the column headers. Column index -> (label, bold, fill)
+    headers = {
+        1: ("Relapse Key", True, W1_HEADER_FILL), 2: ("Gateway", True, W1_HEADER_FILL),
+        3: ("Stacked Type", True, W1_HEADER_FILL), 4: ("Birth Cohort", True, W1_HEADER_FILL),
+        5: ("Mortality Model", True, W1_HEADER_FILL), 6: ("ERR", True, W1_HEADER_FILL),
+        7: ("Model Name", True, W1_HEADER_FILL), 8: (W1_NODE_TOTAL, False, None),
+        10: ("Gateway", True, W1_HEADER_FILL), 11: ("Stacked Type", True, W1_HEADER_FILL),
+        12: ("Birth Cohort", True, W1_HEADER_FILL), 13: ("Mortality Model", True, W1_HEADER_FILL),
+        14: ("ERR", True, W1_HEADER_FILL), 15: ("Model Name", True, W1_HEADER_FILL),
+        16: (W1_NODE_TOTAL, True, W1_HEADER_FILL), 17: (W1_NODE_DIFF, True, W1_HEADER_FILL),
+        19: ("Difference, survivors no relapse vs. survivors 50% relapse", False, None),
+        20: ("Adjusted results, DIFF_ALL", True, W1_ADJUSTED_FILL),
+        22: ("Gateway", False, None), 23: ("StackedType", False, None),
+        24: ("Birth Cohort", False, None), 25: ("Mortality Model", False, None),
+    }
+    for col, (label, bold, fill) in headers.items():
+        _w1_style(ws, W1_PIVOT_HEADER_ROW, col, label, bold=bold, fill=fill)
+
+    # Data rows, values on the pivot columns and formulas everywhere else
+    for i, rec in enumerate(pivot.to_dict("records")):
+        r = W1_PIVOT_FIRST_ROW + i
+        chk = r + 1 if W1_REPLICATE_V_OFFSET else r     # the source workbook's column V quirk
+
+        _w1_style(ws, r, 1, f"=G{r}&F{r}&E{r}")
+        _w1_style(ws, r, 2, f'=IF(ISNUMBER(SEARCH("G10",G{r})),"G10","G25")')
+        _w1_style(ws, r, 3, f'=IF(ISNUMBER(SEARCH("AllAge",G{r})),"AllAge","TwoAge")')
+        _w1_style(ws, r, 4, f"=RIGHT(G{r},3)")
+        _w1_style(ws, r, 5, rec["Mortality Model"])
+        _w1_style(ws, r, 6, rec["ERR"])
+        _w1_style(ws, r, 7, rec["Model Name"])
+        _w1_style(ws, r, 8, rec[W1_NODE_TOTAL], number_format=W1_COUNT_FORMAT)
+
+        _w1_style(ws, r, 10, f'=IF(ISNUMBER(SEARCH("G10",O{r})),"G10","G25")')
+        _w1_style(ws, r, 11, f'=IF(ISNUMBER(SEARCH("AllAge",O{r})),"AllAge","TwoAge")')
+        _w1_style(ws, r, 12, f"=RIGHT(O{r},3)")
+        _w1_style(ws, r, 13, rec["Mortality Model_m"])
+        _w1_style(ws, r, 14, rec["ERR_m"])
+        _w1_style(ws, r, 15, rec["Model Name_m"])
+        _w1_style(ws, r, 16, rec[f"{W1_NODE_TOTAL}_m"], number_format=W1_COUNT_FORMAT)
+        _w1_style(ws, r, 17, rec[f"{W1_NODE_DIFF}_m"], number_format=W1_COUNT_FORMAT)
+
+        # ROUND() so Excel recalculates to the same whole numbers the frame holds
+        s_rule = f"=ROUND(P{r}-H{r},0)" if W1_WHOLE_NUMBERS else f"=(P{r}-H{r})"
+        t_rule = f"=ROUND(Q{r}-S{r},0)" if W1_WHOLE_NUMBERS else f"=(Q{r}-S{r})"
+        _w1_style(ws, r, 19, s_rule, number_format=W1_COUNT_FORMAT)
+        _w1_style(ws, r, 20, t_rule, number_format=W1_COUNT_FORMAT)
+
+        _w1_style(ws, r, 22, f"=EXACT(B{chk},J{chk})")
+        _w1_style(ws, r, 23, f"=EXACT(C{r},K{r})")
+        _w1_style(ws, r, 24, f"=EXACT(D{r},L{r})")
+        _w1_style(ws, r, 25, f"=EXACT(E{r},M{r})")
+
+    # Colour the four EXACT() alignment checks: green where the two pivot blocks line up, red
+    # where they do not. Conditional formatting rather than a fixed fill, because the cells hold
+    # formulas: openpyxl cannot know their result, and the colour has to stay correct if anyone
+    # edits the sheet afterwards.
+    last_row = W1_PIVOT_FIRST_ROW + len(pivot) - 1
+    if len(pivot):
+        check_range = f"V{W1_PIVOT_FIRST_ROW}:Y{last_row}"
+        # A conditional format is a differential style, and those take their fill from bgColor.
+        # Setting fgColor here writes a rule that changes the font colour and nothing else.
+        ws.conditional_formatting.add(check_range, FormulaRule(
+            formula=[f"V{W1_PIVOT_FIRST_ROW}=TRUE"],
+            fill=PatternFill(bgColor=W1_TRUE_FILL),
+            font=Font(color=W1_TRUE_FONT, bold=True), stopIfTrue=True))
+        ws.conditional_formatting.add(check_range, FormulaRule(
+            formula=[f"V{W1_PIVOT_FIRST_ROW}=FALSE"],
+            fill=PatternFill(bgColor=W1_FALSE_FILL),
+            font=Font(color=W1_FALSE_FONT, bold=True), stopIfTrue=True))
+
+    widths = {1: 60, 2: 13, 3: 15, 4: 17, 5: 24, 6: 8, 7: 47, 8: 14, 9: 3, 10: 13, 11: 15,
+              12: 17, 13: 24, 14: 8, 15: 50, 16: 14, 17: 14, 18: 3, 19: 22, 20: 22, 21: 3,
+              22: 11, 23: 13, 24: 13, 25: 17}
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.freeze_panes = f"A{W1_PIVOT_FIRST_ROW}"
+
+
+def w1_write_detail_sheet(wb, detail: pd.DataFrame) -> None:
+    """Write the 'Detailed Results' tab, with Key and QC as live formulas."""
+    if W1_DETAIL_SHEET in wb.sheetnames:
+        del wb[W1_DETAIL_SHEET]
+    ws = wb.create_sheet(W1_DETAIL_SHEET)
+
+    _w1_style(ws, 1, 1, W1_TITLE, bold=True)
+    for j, col in enumerate(detail.columns, start=1):
+        _w1_style(ws, W1_DETAIL_HEADER_ROW, j, col, bold=True, fill=W1_DETAIL_HEADER_FILL)
+
+    pos = {c: j for j, c in enumerate(detail.columns, start=1)}
+    mean_rule = ('=IF(ISNUMBER(SEARCH("{token}",J{r})),'
+                 "_xlfn.XLOOKUP(J{r},'{sheet}'!A:A,'{sheet}'!T:T),I{r})")
+    if W1_WHOLE_NUMBERS:
+        mean_rule = "=ROUND(" + mean_rule[1:] + ",0)"       # whole survivors in the QC column too
+
+    for i, rec in enumerate(detail.to_dict("records")):
+        r = W1_DETAIL_FIRST_ROW + i
+        for col, j in pos.items():
+            value = rec[col]
+            if col == "Key":
+                value = f"=B{r}&D{r}&C{r}"
+            elif col == "QC" or (col == "Mean" and W1_MEAN_AS_FORMULA):
+                value = mean_rule.format(token=W1_RELAPSE_TOKEN, r=r, sheet=W1_PIVOT_SHEET)
+            elif isinstance(value, float) and np.isnan(value):
+                value = None
+            fmt = "yyyy-mm-dd hh:mm" if "Date" in col else None
+            if col in W1_COUNT_COLUMNS:
+                fmt = W1_COUNT_FORMAT
+            _w1_style(ws, r, j, value, number_format=fmt)
+
+    for col, j in pos.items():
+        longest = int(detail[col].astype(str).str.len().max()) if len(detail) else 0
+        ws.column_dimensions[get_column_letter(j)].width = min(max(len(col) + 2, longest + 2), 55)
+    ws.freeze_panes = f"A{W1_DETAIL_FIRST_ROW}"
+
+
+# ================================================================================================
+# SECTION W1.7. ORCHESTRATOR
+# ================================================================================================
+#
+# `relapse_calculations` runs the workflow end to end and returns the intermediate frames, so
+# any step
+# can be inspected without rerunning it.
+
+def relapse_calculations(wd, infile, outfile=None, out_dir=None) -> dict:
+    """Run Workflow 1 and save the workbook Workflow 2 consumes."""
+    wd = Path(wd)
+    in_path = wd / infile
+    if not in_path.exists():
+        raise FileNotFoundError(f"File not found: {in_path}")
+
+    out_dir = Path(out_dir) if out_dir else wd
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / (outfile or W1_OUTPUT_FILE)
+
+    # W1.2 to W1.5
+    src = w1_read_source(in_path)
+    relapse, master = w1_build_pivots(src)
+    pivot = w1_build_pivot_sheet(relapse, master)
+    detail = w1_build_detail_sheet(src, pivot)
+
+    # W1.6, keep every original sheet and add the two generated ones
+    wb = load_workbook(in_path)
+    # Each writer drops the tab if it already exists and recreates it, so the two generated tabs
+    # always land at the end in this order, after every sheet carried over from the input
+    w1_write_pivot_sheet(wb, pivot)
+    w1_write_detail_sheet(wb, detail)
+    wb.save(out_path)
+
+    n_rel = int(detail["Model Name"].str.contains(W1_RELAPSE_TOKEN, case=False, regex=False).sum())
+    print(f"File Saved: '{out_path.name}'")
+    print(f"Location  : {out_path.parent}")
+    print(f"  {W1_SOURCE_SHEET:<32} {len(src):>4} source row(s) carried through")
+    print(f"  {W1_PIVOT_SHEET:<32} {len(pivot):>4} row(s), {len(pivot.columns)} column(s)")
+    print(f"  {W1_DETAIL_SHEET:<32} {len(detail):>4} row(s), "
+          f"{n_rel} relapse adjusted, {len(detail) - n_rel} unchanged")
+
+    return {"source": src, "relapse_pivot": relapse, "master_pivot": master,
+            "pivot_and_calcs": pivot, "detailed_results": detail, "output_file": out_path}
+
+
+# ================================================================================================
+# SECTION W1.8. RUN WORKFLOW 1
+# ================================================================================================
+
+
+# ================================================================================================
+# SECTION W1.9. MOCK DATA TEST FOR WORKFLOW 1
+# ================================================================================================
+#
+# Builds a mock `Detailed Results ALL.T DIFF_ALL` tab with the same column names and naming
+# conventions as the real export, runs the workflow over it, and checks the two calc columns
+# against a
+# hand computed expectation. Nothing outside the temporary folder is touched, and this section
+# does
+# not depend on Workflow 2 in any way.
+
+W1_DEMO_PRODUCT = "Product_Name"      # stands in for the real product name
+
+
+def w1_build_mock_source(folder, n_cohorts: int = 11) -> Path:
+    """Write a mock workbook with the same tab and column names as the real export."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(11)
+
+    templates = {
+        "master": "Master Model {gw} " + W1_DEMO_PRODUCT + "_TwoAge_5a_6a_14b_15a_B{bc:02d}",
+        "relapse": "Master Model {gw} " + W1_DEMO_PRODUCT + " Relapse_TwoAge_B{bc:02d}",
+    }
+    rows = []
+    for kind, template in templates.items():
+        for gw in ("G10", "G25"):
+            for mm in ("JAGS_Male_2000", "JAGS_Female_2000"):
+                for err in (0.05, 0.1):
+                    for bc in range(1, n_cohorts + 1):
+                        survivors = float(rng.uniform(670_000, 790_000))
+                        diff = float(rng.uniform(1, 2_700))
+                        for node, mean in ((W1_NODE_TOTAL, survivors), (W1_NODE_DIFF, diff)):
+                            rows.append({
+                                "Model Group": f"{W1_DEMO_PRODUCT} YO",
+                                "Model Name": template.format(gw=gw, bc=bc),
+                                "Mortality Model": mm,
+                                "ERR": err,
+                                "ERR Variability": "Variable",
+                                "TP Variability": "Smoking initiation and cessation variable",
+                                "Age Range": "68 - 72",
+                                "Node": node,
+                                "Mean": mean,
+                                "Trans. Prob Stand. Dev.": 0.01,
+                                "ERR Standard Deviation": 0.01,
+                                "QALE Mean": "N/A", "QALE 2.5%": "N/A", "QALE 97.5%": "N/A",
+                                "LE Mean": "N/A", "LE 2.5%": "N/A", "LE 97.5%": "N/A",
+                                "Creation Date": pd.Timestamp("2026-08-20 00:51:24"),
+                                "Web Version": "3.0.0", "R Version": "1.8",
+                            })
+    src = pd.DataFrame(rows)
+
+    # The export puts a title in row 1 and the header in row 2, so the mock does too
+    stacked = pd.concat([pd.DataFrame([[W1_TITLE] + [None] * (src.shape[1] - 1)]),
+                         pd.DataFrame([src.columns.tolist()]),
+                         pd.DataFrame(src.values)], ignore_index=True)
+    path = folder / "MOCK_DetailedModelResults.xlsx"
+    with pd.ExcelWriter(path) as xl:
+        stacked.to_excel(xl, sheet_name=W1_SOURCE_SHEET, index=False, header=False)
+    return path
+
+
+# ================================================================================================
+# WORKFLOW 2, POPULATION EXTRAPOLATION
+# ================================================================================================
+#
+# Independent of Workflow 1. It needs the two input workbooks on disk and nothing else, so it
+# runs on
+# its own from a fresh kernel.
+#
+# The pipeline takes per birth cohort model output (means by sex, ERR and mortality model year),
+# weights it by the sex distribution of the target population, rescales it from the simulated
+# population size to the real number of births in each birth cohort, and returns extrapolated
+# case
+# counts by birth cohort plus a total per model. It then puts the Relapse and No Relapse totals
+# side by
+# side so the difference can be read off directly.
+#
+# | R package in the original script | Python equivalent used here |
+# |---|---|
+# | `readxl` | `pandas.read_excel` (engine `openpyxl`) |
+# | `plyr::ddply` | `pandas.DataFrame.groupby(...).sum()` |
+# | `reshape::cast` | `pandas.DataFrame.pivot` |
+# | `writexl` | `pandas.ExcelWriter` plus `openpyxl` styling |
+#
+
+# ================================================================================================
+# SECTION W2.0. IMPORTS AND CONSTANTS
+# ================================================================================================
+#
+# Repeated deliberately so this half of the notebook stands alone. Everything that might need
+# adjusting later lives here rather than buried in a function.
+
+# ---------------------------------------------------------------- input tabs
+RESULTS_SHEET = "Detailed Results"   # tab written by Workflow 1
+PARAM_SHEET = "Parameters"           # tab in the inputs file holding Name / Value pairs
+BIRTHS_SHEET = "Births"              # tab in the inputs file holding births by year and country
+
+# ------------------------------------------------------------------ pipeline
+# Keys that identify one model result before Male / Female are pivoted apart
+INDEX_KEYS = ["Group", "Name", "Gateway", "Birth.Cohort", "ERR", "Mortality.Model.Year"]
+TOTAL_KEYS = ["Group", "Name", "Gateway", "ERR", "Mortality.Model.Year"]
+
+# How a No Relapse total is matched to its Relapse counterpart. 'Name' is deliberately not a key,
+# the two arms are named differently. If the match fails the code retries without 'Group'.
+MATCH_KEYS = ["Group", "Gateway", "ERR", "Mortality.Model.Year"]
+
+RELAPSE_LEVELS = ["Relapse", "No Relapse"]
+
+# A model is Relapse when its group or name matches RELAPSE_PATTERN and not NO_RELAPSE_PATTERN.
+# Everything else is No Relapse, which is what the real exports need: the No Relapse models are
+# named 'Master Model G10 Product_Name YO_TwoAge_5a_6a_14b_15a' with no relapse wording at all.
+RELAPSE_PATTERN = r"relapse"
+NO_RELAPSE_PATTERN = r"\bno relapse\b|\bnon relapse\b|\bwithout relapse\b|\bno_relapse\b"
+
+# Marker tokens trimmed off the end of 'Model Group' to leave the product name:
+# 'Product_Name YO' -> 'Product_Name'. Keep this list to study markers only, a token that is part
+# of the product itself must not appear here or it will be stripped out of the product name.
+PRODUCT_GROUP_SUFFIXES = ["YO"]
+
+# ------------------------------------------------------------- output workbook
+SHEET_META = "Metadata"                          # worksheet 1, the cover sheet
+SHEET_ALL = "Results from Python"                # worksheet 2
+SHEET_RELAPSE = "Relapse"                        # worksheet 3
+SHEET_NO_RELAPSE = "No Relapse and final Results"  # worksheet 4
+
+BASE_COLUMNS = ["Group", "Name", "ERR", "Gateway", "Mortality.Model.Year",
+                "Birth.Cohort", "Mean.extrapolated", "Relapse.Status"]
+RESULTS_TAB_COLUMNS = BASE_COLUMNS
+RELAPSE_TAB_COLUMNS = BASE_COLUMNS
+NO_RELAPSE_TAB_COLUMNS = ["Group", "Name", "ERR", "Gateway", "Mortality.Model.Year",
+                          "Birth.Cohort", "Relapse.Status"]
+
+NO_RELAPSE_MEAN_COL = "No Relapse_Mean.extrapolated"
+RELAPSE_MEAN_COL = "Relapse_Mean.extrapolated"
+DELTA_COL = "Delta"
+PASTE_COL = "To Paste in Table B2"
+COMPARISON_COLUMNS = [NO_RELAPSE_MEAN_COL, RELAPSE_MEAN_COL, DELTA_COL, PASTE_COL]
+
+PASTE_SIGNED = False   # False renders '219,825(3954)', True renders '219,825(+3954)'
+
+# ----------------------------------------------------------------- provenance
+PIPELINE_VERSION = "3.0"
+VERSION_TYPE = "Final"     # for example Draft, QC or Final
+ANALYSIS_OBJECTIVE = ("Extrapolate the relapse adjusted disease model output from the simulated "
+                      "cohort to the real population, and quantify the difference between the "
+                      "relapse and no relapse arms for each gateway, ERR and mortality model year.")
+
+# ---------------------------------------------------------------------- style
+SHEET_FONT = "Calibri"
+SHEET_FONT_SIZE = 11
+HEADER_FILL = "E26B0A"        # orange header fill
+HEADER_FONT_COLOR = "000000"  # black bold header text
+HIGHLIGHT_FILL = "FFFF00"     # yellow fill on the paste column
+META_LABEL_FILL = "F2F2F2"    # grey field labels on the cover sheet
+NUMBER_FORMATS = {"Mean.extrapolated": "0", NO_RELAPSE_MEAN_COL: "0",
+                  RELAPSE_MEAN_COL: "#,##0", DELTA_COL: "0"}
+
+pd.set_option("display.width", 220)
+pd.set_option("display.max_columns", 40)
+
+print(f"Workflow 2 ready | pandas {pd.__version__} | numpy {np.__version__}")
+
+
+# ================================================================================================
+# SECTION W2.1. CONFIGURATION
+# ================================================================================================
+#
+# Two input files and one output file.
+#
+# * `PRODUCT_NAME`: leave as `None` and the product is read from the `Model Group` column of the
+#   relapse calculations file, so `Product_Name YO` gives `Product_Name`. Set it to a string to
+#   override. The comparison is whitespace agnostic, so `Product_Name`, `product name` and
+#   `ProductName` all count as the same product, and a mismatch against the file raises rather
+# than
+#   quietly labelling the output with the wrong product.
+# * `AUTHOR_NAME`: leave as `None` and the author is taken from the user folder in `WORKING_DIR`, for
+#   example `C:\Users\YemiOdeyemi\...` gives `Yemi Odeyemi`.
+
+
+# ================================================================================================
+# SECTION W2.2. UTILITY HELPERS, PRODUCT NAME AND AUTHOR
+# ================================================================================================
+#
+# `normalise_product` is the whitespace agnostic comparison: it lower cases and strips spaces,
+# underscores and hyphens, so `Product_Name`, `product name` and `ProductName` collapse to one
+# value.
+# `product_slug` is the filename safe form, spaces become underscores.
+#
+# `extract_product_name` takes the most common `Model Group` in the results file and trims a
+# trailing
+# marker token such as `YO`. `extract_author` reads the user folder out of the path and splits
+# camel
+# case, so `YemiOdeyemi` reads as `Yemi Odeyemi`.
+
+def right(text, num_char: int) -> str:
+    """Return the last `num_char` characters of `text`, mirroring the R helper."""
+    s = "" if text is None else str(text)
+    return s[-num_char:] if num_char > 0 else ""
+
+
+def dedupe_columns(cols) -> list[str]:
+    """Strip whitespace from headers and suffix repeats, e.g. '95% PI' then '95% PI 2'."""
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for c in cols:
+        c = str(c).strip()
+        if c in seen:
+            seen[c] += 1
+            out.append(f"{c} {seen[c]}")
+        else:
+            seen[c] = 1
+            out.append(c)
+    return out
+
+
+GATEWAY_PATTERN = r"(?<![A-Za-z0-9])(G\d+)(?![A-Za-z0-9])"
+
+
+def extract_gateway(names: pd.Series, pattern: str = GATEWAY_PATTERN) -> pd.Series:
+    """Pull the gateway token (G10, G25, ...) out of the model name."""
+    found = names.astype(str).str.extract(pattern, expand=False).str.upper()
+    n_missing = int(found.isna().sum())
+    if n_missing:
+        examples = names[found.isna()].astype(str).unique()[:3].tolist()
+        warnings.warn(f"No gateway token found in {n_missing} model name(s), "
+                      f"'Gateway' left blank for those. Examples: {examples}")
+    return found.fillna("")
+
+
+def to_int(series: pd.Series) -> pd.Series:
+    """Round to a nullable integer so Excel shows 219825, not 219825.0."""
+    return pd.to_numeric(series, errors="coerce").round().astype("Float64").astype("Int64")
+
+
+def normalise_product(name) -> str:
+    """Whitespace agnostic key: 'Product_Name', 'product name' and 'ProductName' all match."""
+    return re.sub(r"[\s_\-]+", "", str(name)).casefold()
+
+
+def product_slug(name) -> str:
+    """Filename safe product name, 'Product Name' -> 'Product_Name'."""
+    slug = re.sub(r"\s+", "_", str(name).strip())
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", slug).strip("_") or "Product"
+
+
+def extract_product_name(model_groups: pd.Series,
+                         suffixes: list[str] | None = None) -> tuple[str, str]:
+    """Derive the product from 'Model Group', returning (product, model group used)."""
+    groups = model_groups.astype(str).str.strip()
+    groups = groups[groups != ""]
+    if groups.empty:
+        raise ValueError("'Model Group' is empty, the product name cannot be extracted.")
+
+    distinct = groups.unique().tolist()
+    if len(distinct) > 1:
+        warnings.warn(f"'Model Group' holds more than one value {distinct}, using the most common.")
+    group = groups.mode().iloc[0]
+
+    tokens = group.split()
+    drop = {s.casefold() for s in (suffixes if suffixes is not None else PRODUCT_GROUP_SUFFIXES)}
+    while len(tokens) > 1 and tokens[-1].casefold() in drop:
+        tokens.pop()
+    return " ".join(tokens), group
+
+
+def extract_author(path=None) -> str:
+    """Read the account name out of the path, 'C:\\Users\\YemiOdeyemi\\...' -> 'Yemi Odeyemi'."""
+    parts = [p for p in re.split(r"[\\/]+", str(path or Path.cwd())) if p]
+    name = None
+    for i, part in enumerate(parts[:-1]):
+        if part.casefold() in ("users", "home"):
+            name = parts[i + 1]
+            break
+    if not name:
+        try:
+            name = getpass.getuser()
+        except Exception:
+            name = "Unknown"
+    name = re.sub(r"[._-]+", " ", str(name))
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)   # YemiOdeyemi -> Yemi Odeyemi
+    return " ".join(w[:1].upper() + w[1:] for w in name.split())
+
+
+# ================================================================================================
+# SECTION W2.3. LOAD THE INPUTS WORKBOOK
+# ================================================================================================
+#
+# Reads the `Parameters` and `Births` tabs. Headers and parameter names are stripped of stray
+# whitespace, which is the most common cause of a lookup failing on a hand edited workbook.
+
+def load_input_workbook(ifile) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read the 'Parameters' and 'Births' sheets from the inputs workbook."""
+    params = pd.read_excel(ifile, sheet_name=PARAM_SHEET)
+    births = pd.read_excel(ifile, sheet_name=BIRTHS_SHEET)
+
+    params.columns = [str(c).strip() for c in params.columns]
+    births.columns = [str(c).strip() for c in births.columns]
+
+    for need, frame, sheet in (("Name", params, PARAM_SHEET), ("Value", params, PARAM_SHEET),
+                               ("Country", births, BIRTHS_SHEET), ("Year", births, BIRTHS_SHEET),
+                               ("Births", births, BIRTHS_SHEET)):
+        if need not in frame.columns:
+            raise KeyError(f"Sheet '{sheet}' is missing the required column '{need}'.")
+
+    params["Name"] = params["Name"].astype(str).str.strip()
+    return params, births
+
+
+# ================================================================================================
+# SECTION W2.4. MODEL PARAMETERS
+# ================================================================================================
+#
+# ```
+# max_age = min_age - 1 + (n_bc * width)
+# ```
+#
+# Lookups are case insensitive and raise a clear error when a parameter is missing or is not
+# numeric,
+# rather than silently producing a blank.
+
+def get_param(params: pd.DataFrame, name: str, as_numeric: bool = True, required: bool = True):
+    """Fetch one value from the Name / Value parameter table."""
+    hit = params.loc[params["Name"].str.casefold() == str(name).casefold(), "Value"]
+    if hit.empty:
+        if required:
+            raise KeyError(f"Parameter '{name}' not found in the '{PARAM_SHEET}' sheet.")
+        return None
+    val = hit.iloc[0]
+    if as_numeric:
+        num = pd.to_numeric(pd.Series([val]), errors="coerce").iloc[0]
+        if pd.isna(num):
+            raise ValueError(f"Parameter '{name}' is not numeric (got: {val!r}).")
+        return float(num)
+    return str(val).strip()
+
+
+def derive_parameters(params: pd.DataFrame) -> dict:
+    """Collect every scalar the pipeline needs and derive the maximum age."""
+    min_age = int(get_param(params, "Start Age"))
+    width = int(get_param(params, "Age Category Width"))
+    n_bc = int(get_param(params, "Number of Birth Cohorts"))
+    cfg = {
+        "year": int(get_param(params, "Year of Cross-Section")),  # year of the cross section
+        "min_age": min_age,                                       # youngest age modelled
+        "width": width,                                           # years per age category
+        "n_bc": n_bc,                                             # number of birth cohorts
+        "max_age": min_age - 1 + (n_bc * width),                  # oldest age modelled
+        "female_prop": get_param(params, "Proportion of Population as Females"),
+        "pop_size": get_param(params, "Population Size"),         # simulated population size
+        "country": get_param(params, "Country", as_numeric=False),
+    }
+    if cfg["pop_size"] == 0:
+        raise ValueError("'Population Size' must not be zero, it is the denominator of the scaling step.")
+    return cfg
+
+
+# ================================================================================================
+# SECTION W2.5. BIRTH COHORTS AND TOTAL BIRTHS
+# ================================================================================================
+#
+# ```
+# Year          = year of cross section - age
+# Birth.Cohort  = floor((age - min_age) / width) + 1
+# ```
+#
+# A warning is raised when the births table does not cover every year in the range, a gap that
+# would
+# otherwise silently shrink a cohort total.
+
+def build_birth_cohorts(cfg: dict, births: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Map ages to birth years and cohorts, then total the births in each cohort."""
+    b_yr = pd.DataFrame({"age": np.arange(cfg["min_age"], cfg["max_age"] + 1, dtype=int)})
+    b_yr["Year"] = cfg["year"] - b_yr["age"]
+    b_yr["Birth.Cohort"] = np.floor((b_yr["age"] - cfg["min_age"]) / cfg["width"]).astype(int) + 1
+
+    b_sub = births.loc[
+        births["Country"].astype(str).str.strip().str.casefold() == str(cfg["country"]).casefold()
+    ].copy()
+    if b_sub.empty:
+        raise ValueError(f"No rows in '{BIRTHS_SHEET}' for Country == {cfg['country']!r}.")
+
+    on = [c for c in b_yr.columns if c in b_sub.columns]      # the shared key is 'Year'
+    if not on:
+        raise ValueError("No shared key column (expected 'Year') between the age table and Births.")
+
+    c_births = b_yr.merge(b_sub, on=on, how="inner")
+
+    missing = sorted(set(b_yr["Year"]) - set(c_births["Year"]))
+    if missing:
+        warnings.warn(f"Births missing for {len(missing)} year(s), cohort totals will be low: {missing[:10]}")
+
+    s_births = (c_births.groupby("Birth.Cohort", as_index=False)["Births"]
+                        .sum()
+                        .rename(columns={"Births": "sum.births"}))
+    return s_births, c_births
+
+
+# ================================================================================================
+# SECTION W2.6. READ THE DETAILED RESULTS TAB
+# ================================================================================================
+#
+# The tab written by Workflow 1 puts a title in row 1 and the header in row 2, so the header row
+# is
+# found rather than assumed. The `Mean` column read here is the relapse adjusted one, not the
+# raw
+# webtool figure, which is carried alongside as `Mean_Webtool`.
+
+def load_detailed_results(rfile, sheet: str = RESULTS_SHEET) -> pd.DataFrame:
+    """Read the results tab, find the real header row, and drop repeated headers."""
+    raw = pd.read_excel(rfile, sheet_name=sheet, header=None, dtype=object)
+    first_col = raw.iloc[:, 0].astype(str).str.strip()
+    hdr_rows = np.flatnonzero(first_col.values == "Model Group")
+
+    if hdr_rows.size:
+        i = int(hdr_rows[0])
+        res = raw.iloc[i + 1:].copy()
+        res.columns = dedupe_columns(raw.iloc[i].tolist())
+    else:
+        res = pd.read_excel(rfile, sheet_name=sheet, dtype=object)
+        res.columns = dedupe_columns(res.columns)
+
+    res = res.reset_index(drop=True)
+    res = res.loc[res["Model Group"].notna()]                                   # blank spacer rows
+    res = res.loc[res["Model Group"].astype(str).str.strip() != "Model Group"]  # repeated headers
+    res = res.dropna(axis=1, how="all")                                         # empty columns
+
+    for need in ("Model Group", "Model Name", "Mortality Model", "Mean"):
+        if need not in res.columns:
+            raise KeyError(f"Sheet '{sheet}' is missing the required column '{need}'.")
+    if res["Mean"].isna().all():
+        raise ValueError(
+            f"Every 'Mean' value in '{sheet}' is empty. If that column holds an Excel formula "
+            "that has never been calculated, open the workbook in Excel, save it, and rerun. "
+            "Workflow 1 writes 'Mean' as a value precisely to avoid this.")
+
+    return res.reset_index(drop=True)
+
+
+# ================================================================================================
+# SECTION W2.7. FORMAT THE RESULTS
+# ================================================================================================
+#
+# * `Name`: `Model Name` with the last 4 characters removed, that suffix is the cohort tag
+# * `Birth.Cohort`: the last 2 characters of `Model Name`, as an integer
+# * `Gateway`: the `G` token inside `Name`, for example `G10` or `G25`
+# * `mortality.model`: second element of `Mortality Model` split on `_`, the sex
+# * `Mortality.Model.Year`: third element of the same split
+
+def format_results(res: pd.DataFrame) -> pd.DataFrame:
+    """Derive Name, Gateway, Birth.Cohort, sex and mortality model year from the identifiers."""
+    res = res.copy()
+
+    model_name = res["Model Name"].astype(str).str.strip()
+    res["Name"] = model_name.str[:-4]                     # drop the 4 character cohort tag
+    res["Group"] = res["Model Group"].astype(str).str.strip()
+    res["Birth.Cohort"] = pd.to_numeric(model_name.str[-2:], errors="coerce").astype("Int64")
+    res["Gateway"] = extract_gateway(res["Name"])         # G10 / G25
+
+    # 'Mortality Model' looks like Source_Sex_Year, e.g. JAGS_Male_2000
+    parts = res["Mortality Model"].astype(str).str.strip().str.split("_", expand=True)
+    if parts.shape[1] < 3:
+        raise ValueError("'Mortality Model' values must split into 3 parts on '_' (e.g. JAGS_Male_2000).")
+    res["mortality.model"] = parts[1].str.strip().str.title()   # Male / Female
+    res["Mortality.Model.Year"] = parts[2].str.strip()          # 2000 / 2017
+
+    res["Mean"] = pd.to_numeric(res["Mean"], errors="coerce")
+    if "ERR" in res.columns:
+        res["ERR"] = res["ERR"].apply(lambda v: v.strip() if isinstance(v, str) else v)
+    else:
+        res["ERR"] = pd.NA
+
+    bad = int(res["Birth.Cohort"].isna().sum())
+    if bad:
+        warnings.warn(f"{bad} row(s) have a 'Model Name' not ending in 2 digits and were dropped.")
+
+    return res.loc[res["Birth.Cohort"].notna()].reset_index(drop=True)
+
+
+# ================================================================================================
+# SECTION W2.8. RESHAPE LONG TO WIDE
+# ================================================================================================
+#
+# Cohorts beyond `Number of Birth Cohorts` are filtered out, then Male and Female become their
+# own
+# columns. `pivot` is used rather than `pivot_table` on purpose: `pivot_table` would quietly
+# average
+# duplicate rows. Duplicates are detected up front and reported with the offending model names,
+# so a
+# model that was run twice in the webtool can be found and removed.
+
+def cast_results(res: pd.DataFrame, n_bc: int) -> pd.DataFrame:
+    """Pivot Male and Female means into side by side columns, one row per model and cohort."""
+    sub = res.loc[res["Birth.Cohort"] <= n_bc].copy()
+    if sub.empty:
+        raise ValueError(f"No rows left after filtering to Birth.Cohort <= {n_bc}.")
+
+    for key in INDEX_KEYS:                       # NaN keys would be dropped by pivot
+        if sub[key].isna().any():
+            sub[key] = sub[key].fillna("")
+
+    dup_mask = sub.duplicated(subset=INDEX_KEYS + ["mortality.model"], keep=False)
+    if dup_mask.any():
+        offenders = sub.loc[dup_mask, ["Model Name", "Mortality Model"]].drop_duplicates()
+        raise ValueError(
+            "Duplicate rows for the same model / sex / cohort / ERR / mortality year.\n"
+            "A model was most likely run more than once in the webtool, so the export holds "
+            "replicate entries that need to be deleted.\n"
+            f"Offending entries:\n{offenders.to_string(index=False)}")
+
+    wide = sub.pivot(index=INDEX_KEYS, columns="mortality.model", values="Mean").reset_index()
+    wide.columns.name = None
+
+    for sex in ("Male", "Female"):
+        if sex not in wide.columns:
+            raise ValueError(f"No '{sex}' rows found, both sexes are required from the same mortality model year.")
+    if wide[["Male", "Female"]].isna().any().any():
+        warnings.warn("Some model / cohort combinations are missing a Male or Female mean, "
+                      "those rows extrapolate to NaN.")
+
+    wide["Birth.Cohort"] = wide["Birth.Cohort"].astype(int)
+    return wide
+
+
+# ================================================================================================
+# SECTION W2.9. EXTRAPOLATION
+# ================================================================================================
+#
+# ```
+# Mean.extrapolated = round( (Male * (1 - female_prop) + Female * female_prop)
+#                            * sum.births / pop_size , 0 )
+# ```
+#
+# The sex weighted mean is a rate per `pop_size` simulated people, multiplying by the real
+# births in
+# the cohort and dividing by `pop_size` rescales it to the actual population. `np.round` uses
+# half to
+# even rounding, matching R's `round`.
+
+def extrapolate(s_births: pd.DataFrame, wide: pd.DataFrame,
+                female_prop: float, pop_size: float) -> pd.DataFrame:
+    """Weight Male and Female means by the sex split and rescale to the real birth counts."""
+    res1 = s_births.merge(wide, on="Birth.Cohort", how="inner")
+    if res1.empty:
+        raise ValueError("No overlap between the birth cohorts in the births table and in the results file.")
+
+    weighted_mean = (res1["Male"] * (1 - female_prop)) + (res1["Female"] * female_prop)
+    res1["Mean.extrapolated"] = to_int(np.round(weighted_mean * res1["sum.births"] / pop_size, 0))
+    return res1
+
+
+# ================================================================================================
+# SECTION W2.10. TOTALS AND ORDERING
+# ================================================================================================
+#
+# Totals are summed across birth cohorts within each Group, Name, Gateway, ERR and mortality
+# model
+# year, and labelled `Total`. Sorting uses a temporary numeric copy of `Birth.Cohort` so the
+# `Total`
+# row falls last within each model.
+
+def add_totals(res1: pd.DataFrame) -> pd.DataFrame:
+    """Append a 'Total' row per model and sort the detail plus total rows."""
+    keep_cols = TOTAL_KEYS + ["Birth.Cohort", "Mean.extrapolated"]
+
+    tot = res1.groupby(TOTAL_KEYS, as_index=False, dropna=False)["Mean.extrapolated"].sum()
+    tot["Birth.Cohort"] = "Total"
+
+    fin = pd.concat([res1[keep_cols], tot[keep_cols]], ignore_index=True)
+
+    fin["Birth.Cohort"] = fin["Birth.Cohort"].astype(object)
+    fin["_bc_sort"] = pd.to_numeric(fin["Birth.Cohort"], errors="coerce")   # 'Total' becomes NaN
+    fin = fin.sort_values(["ERR", "Mortality.Model.Year", "Name", "_bc_sort"],
+                          na_position="last", kind="mergesort")
+    return fin.drop(columns="_bc_sort").reset_index(drop=True)
+
+
+# ================================================================================================
+# SECTION W2.11. RELAPSE CLASSIFICATION, TWO LEVELS ONLY
+# ================================================================================================
+#
+# The rule is one sided and always resolves, so `Relapse.Status` is guaranteed to be a two level
+# categorical:
+#
+# * a row is `Relapse` when the group and name text contains `relapse` and does not contain a negated
+#   form such as `no relapse`
+# * every other row is `No Relapse`
+#
+# Nothing raises. If one level ends up empty a warning is issued, since that is the real signal
+# that
+# the naming convention has changed.
+
+def classify_relapse(df: pd.DataFrame,
+                     columns=("Group", "Name"),
+                     relapse_pattern: str = RELAPSE_PATTERN,
+                     no_relapse_pattern: str = NO_RELAPSE_PATTERN) -> pd.DataFrame:
+    """Label every row 'Relapse' or 'No Relapse' as a strict two level categorical."""
+    present = [c for c in columns if c in df.columns]
+    if not present:
+        raise KeyError(f"None of {columns} are available to classify relapse status.")
+
+    # 'Master Model G10 Product_Name Relapse_TwoAge' -> 'master model g10 product name relapse twoage'
+    blob = df[present].astype(str).agg(" ".join, axis=1).str.casefold()
+    norm = blob.str.replace(r"[^a-z0-9]+", " ", regex=True).str.strip()
+
+    is_relapse = (norm.str.contains(relapse_pattern, regex=True)
+                  & ~norm.str.contains(no_relapse_pattern, regex=True))
+
+    out = df.copy()
+    out["Relapse.Status"] = pd.Categorical(np.where(is_relapse, "Relapse", "No Relapse"),
+                                           categories=RELAPSE_LEVELS, ordered=False)
+
+    counts = out["Relapse.Status"].value_counts()
+    for level in RELAPSE_LEVELS:
+        if counts.get(level, 0) == 0:
+            warnings.warn(f"No rows were classified as '{level}'. Check the model naming, or pass "
+                          f"a different relapse_pattern to classify_relapse.")
+    return out
+
+
+# ================================================================================================
+# SECTION W2.12. BUILD THE TWO FILTERED TABS
+# ================================================================================================
+#
+# `Relapse` is every Relapse row, all birth cohorts and the `Total`. `No Relapse and final
+# Results` is
+# the `Total` row of every No Relapse model with the comparison columns appended.
+#
+# ```
+# No Relapse_Mean.extrapolated = the No Relapse total
+# Relapse_Mean.extrapolated    = the matching Relapse total
+# Delta                        = No Relapse_Mean.extrapolated - Relapse_Mean.extrapolated
+# To Paste in Table B2         = "{Relapse_Mean.extrapolated:,}({gap})",  gap = -Delta
+# ```
+#
+# A Relapse total sitting 3,954 above the No Relapse total reads `219,825(3954)` with `Delta =
+# -3954`,
+# and an exact match reads `200,301(0)`.
+
+def _format_paste_cell(relapse_value, gap, signed: bool = PASTE_SIGNED) -> str:
+    """Render the paste string, e.g. '219,825(3954)' or '200,301(0)'."""
+    if pd.isna(relapse_value) or pd.isna(gap):
+        return ""
+    gap = int(round(float(gap)))
+    inside = f"{gap:+d}" if (signed and gap != 0) else f"{gap:d}"
+    return f"{int(round(float(relapse_value))):,}({inside})"
+
+
+def build_relapse_tab(results: pd.DataFrame, columns: list[str] | None = None) -> pd.DataFrame:
+    """Worksheet 3: every Relapse row, all birth cohorts plus the Total row."""
+    cols = columns or RELAPSE_TAB_COLUMNS
+    tab = results.loc[results["Relapse.Status"] == "Relapse"]
+    if tab.empty:
+        warnings.warn("No Relapse rows found, that worksheet will contain headers only.")
+    return tab.loc[:, [c for c in cols if c in tab.columns]].reset_index(drop=True)
+
+
+def build_no_relapse_tab(results: pd.DataFrame,
+                         columns: list[str] | None = None,
+                         match_keys: list[str] | None = None) -> pd.DataFrame:
+    """Worksheet 4: No Relapse total rows plus the four comparison columns."""
+    cols = columns or NO_RELAPSE_TAB_COLUMNS
+    keys = list(match_keys or MATCH_KEYS)
+    is_total = results["Birth.Cohort"].astype(str) == "Total"
+
+    no_rel = results.loc[(results["Relapse.Status"] == "No Relapse") & is_total].copy()
+    rel = results.loc[(results["Relapse.Status"] == "Relapse") & is_total].copy()
+    if no_rel.empty:
+        warnings.warn("No 'No Relapse' total rows found, that worksheet will contain headers only.")
+
+    def _lookup(keys_used: list[str]) -> pd.Series:
+        """Return the matching Relapse total for each No Relapse row, NA where unmatched."""
+        dup = rel.duplicated(subset=keys_used, keep=False)
+        if dup.any():
+            offenders = rel.loc[dup, keys_used + ["Name"]].drop_duplicates()
+            raise ValueError(
+                f"More than one Relapse total shares the same {keys_used}, so the No Relapse rows "
+                f"cannot be matched one to one:\n{offenders.to_string(index=False)}\n"
+                "Narrow the match by passing match_keys=[...] with an extra column.")
+        ref = rel[keys_used + ["Mean.extrapolated"]].rename(
+            columns={"Mean.extrapolated": RELAPSE_MEAN_COL})
+        return no_rel[keys_used].merge(ref, on=keys_used, how="left")[RELAPSE_MEAN_COL]
+
+    matched = _lookup(keys) if len(no_rel) else pd.Series(dtype="Float64")
+
+    # Fallback: relapse models sometimes sit in their own model group, so retry without 'Group'
+    if len(no_rel) and matched.isna().all() and "Group" in keys and len(keys) > 1:
+        keys = [k for k in keys if k != "Group"]
+        warnings.warn(f"No Relapse to Relapse match found on 'Group', retrying on {keys}.")
+        matched = _lookup(keys)
+
+    out = no_rel.loc[:, [c for c in cols if c in no_rel.columns]].reset_index(drop=True)
+    out[NO_RELAPSE_MEAN_COL] = to_int(no_rel["Mean.extrapolated"].reset_index(drop=True))
+    out[RELAPSE_MEAN_COL] = to_int(matched.reset_index(drop=True))
+    out[DELTA_COL] = out[NO_RELAPSE_MEAN_COL] - out[RELAPSE_MEAN_COL]
+
+    gap = -out[DELTA_COL]     # positive when the Relapse total is the larger of the two
+    out[PASTE_COL] = [_format_paste_cell(r, g) for r, g in zip(out[RELAPSE_MEAN_COL], gap)]
+
+    unmatched = int(out[RELAPSE_MEAN_COL].isna().sum())
+    if unmatched:
+        warnings.warn(f"{unmatched} No Relapse row(s) have no Relapse counterpart on {keys}, "
+                      "their comparison columns are left blank.")
+
+    return out.loc[:, [c for c in cols if c in out.columns] + COMPARISON_COLUMNS]
+
+
+# ================================================================================================
+# SECTION W2.13. THE METADATA COVER SHEET
+# ================================================================================================
+#
+# Worksheet 1 is a cover sheet in a fixed field and value layout, so it reads the same way on
+# every
+# run and can be diffed between runs. It records who ran the analysis, when, which version, both
+# input
+# files and the output file, the product, the objective, and a key takeaway generated from the
+# results
+# themselves rather than typed by hand.
+#
+# The takeaway names the largest gap between the two arms and states the direction, so the
+# headline
+# number is visible without opening the other tabs.
+
+def build_key_takeaway(final_tab: pd.DataFrame) -> str:
+    """Summarise the relapse against no relapse comparison in one sentence."""
+    usable = final_tab.dropna(subset=[RELAPSE_MEAN_COL, DELTA_COL])
+    if usable.empty:
+        return "No No Relapse total could be matched to a Relapse total, so no comparison is available."
+
+    gaps = (-usable[DELTA_COL]).astype("Float64")     # positive when Relapse is the larger arm
+    worst = usable.loc[gaps.abs().astype(float).idxmax()]
+    worst_gap = int(-worst[DELTA_COL])
+    n_exact = int((gaps == 0).sum())
+
+    if worst_gap == 0:
+        return (f"Across {len(usable)} model configurations the relapse and no relapse totals agree "
+                "exactly, so relapse has no effect on the extrapolated counts.")
+    direction = "above" if worst_gap > 0 else "below"
+    return (f"Across {len(usable)} model configurations the relapse adjusted totals sit "
+            f"{direction} the no relapse totals by up to {abs(worst_gap):,} cases "
+            f"(gateway {worst['Gateway']}, ERR {excel_err(worst['ERR'])}, mortality model year "
+            f"{worst['Mortality.Model.Year']}); {n_exact} of {len(usable)} configurations match exactly.")
+
+
+def excel_err(value) -> str:
+    """Format an ERR value the way it reads in the sheet, 0.05 rather than 0.050000."""
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def build_metadata(context: dict) -> list[tuple[str, str]]:
+    """Return the cover sheet as (label, value) rows. A label of '' starts a new section."""
+    rows: list[tuple[str, str]] = []
+    rows.append(("Run details", ""))
+    rows.append(("Author", context["author"]))
+    rows.append(("Run date", context["run_dt"].strftime("%d %b %Y")))
+    rows.append(("Run time", context["run_dt"].strftime("%H:%M:%S")))
+    rows.append(("Timestamp", context["stamp"]))
+    rows.append(("Pipeline version", f"v{PIPELINE_VERSION}"))
+    rows.append(("Version type", VERSION_TYPE))
+    rows.append(("Environment", f"Python {platform.python_version()}, pandas {pd.__version__}, "
+                                f"numpy {np.__version__}"))
+    rows.append(("Analysis", ""))
+    rows.append(("Product name", context["product"]))
+    rows.append(("Model group", context["model_group"]))
+    rows.append(("Country", str(context["parameters"]["country"])))
+    rows.append(("Year of cross section", str(context["parameters"]["year"])))
+    rows.append(("Birth cohorts", str(context["parameters"]["n_bc"])))
+    rows.append(("Objective", ANALYSIS_OBJECTIVE))
+    rows.append(("Key takeaway", context["takeaway"]))
+    rows.append(("Input files", ""))
+    rows.append(("Input 1", f"{context['input_file'].name}  [{PARAM_SHEET}, {BIRTHS_SHEET}]"))
+    rows.append(("Input 2", f"{context['results_file'].name}  [{RESULTS_SHEET}]"))
+    rows.append(("Input folder", str(context["input_file"].parent)))
+    rows.append(("Output file", ""))
+    rows.append(("File name", context["output_file"].name))
+    rows.append(("Output folder", str(context["output_file"].parent)))
+    for name, frame in context["sheet_shapes"].items():
+        rows.append((f"Worksheet, {name}", f"{frame[0]} row(s), {frame[1]} column(s)"))
+    return rows
+
+
+# ================================================================================================
+# SECTION W2.14. EXCEL EXPORT
+# ================================================================================================
+#
+# One workbook, `PopExtrapolationRes_<Product>_<DDMonYYYY>_<HHMMSS>.xlsx`, with the cover sheet
+# first
+# and the three result tabs after it. Calibri throughout, a bold black header on the orange
+# fill, thin
+# black borders, and the paste column filled yellow.
+
+def _autoformat_sheet(ws, df: pd.DataFrame, highlight_cols=()) -> None:
+    """Apply the house styling: orange header, black borders, yellow paste column."""
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_font = Font(name=SHEET_FONT, size=SHEET_FONT_SIZE, bold=True, color=HEADER_FONT_COLOR)
+    header_fill = PatternFill("solid", fgColor=HEADER_FILL)
+    body_font = Font(name=SHEET_FONT, size=SHEET_FONT_SIZE)
+    highlight = PatternFill("solid", fgColor=HIGHLIGHT_FILL)
+
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    highlight_idx = {i for i, c in enumerate(df.columns, start=1) if c in set(highlight_cols)}
+    for row in ws.iter_rows(min_row=2, max_row=max(ws.max_row, 1)):
+        for cell in row:
+            cell.font = body_font
+            cell.border = border
+            if cell.column in highlight_idx:
+                cell.fill = highlight
+
+    for j, col in enumerate(df.columns, start=1):
+        longest = int(df[col].astype(str).str.len().max()) if len(df) else 0
+        letter = get_column_letter(j)
+        ws.column_dimensions[letter].width = min(max(len(str(col)) + 2, longest + 2), 55)
+        fmt = NUMBER_FORMATS.get(col)
+        if fmt:
+            for cell in ws[letter][1:]:
+                cell.number_format = fmt
+
+    ws.freeze_panes = "A2"
+    if len(df):
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{len(df) + 1}"
+
+
+def _write_metadata_sheet(ws, title: str, rows: list[tuple[str, str]]) -> None:
+    """Write the cover sheet, section headers span both columns."""
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    cell = ws.cell(row=1, column=1, value=title)
+    cell.font = Font(name=SHEET_FONT, size=14, bold=True, color=HEADER_FONT_COLOR)
+    cell.fill = PatternFill("solid", fgColor=HEADER_FILL)
+    cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.cell(row=1, column=2).fill = PatternFill("solid", fgColor=HEADER_FILL)
+    ws.row_dimensions[1].height = 22
+
+    r = 3
+    for label, value in rows:
+        if value == "":                                  # a section header
+            c = ws.cell(row=r, column=1, value=label)
+            c.font = Font(name=SHEET_FONT, size=SHEET_FONT_SIZE, bold=True)
+            c.fill = PatternFill("solid", fgColor=HEADER_FILL)
+            ws.cell(row=r, column=2).fill = PatternFill("solid", fgColor=HEADER_FILL)
+            r += 1
+            continue
+        lc = ws.cell(row=r, column=1, value=label)
+        lc.font = Font(name=SHEET_FONT, size=SHEET_FONT_SIZE, bold=True)
+        lc.fill = PatternFill("solid", fgColor=META_LABEL_FILL)
+        lc.border = border
+        lc.alignment = Alignment(vertical="top")
+        vc = ws.cell(row=r, column=2, value=value)
+        vc.font = Font(name=SHEET_FONT, size=SHEET_FONT_SIZE)
+        vc.border = border
+        vc.alignment = Alignment(vertical="top", wrap_text=True)
+        r += 1
+
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 105
+    ws.sheet_view.showGridLines = False
+
+
+def export_pop_extrapolation(results: pd.DataFrame,
+                             context: dict,
+                             prefix: str = "PopExtrapolationRes_",
+                             match_keys: list[str] | None = None) -> tuple[Path, dict]:
+    """Write the four worksheet workbook and return its path plus the frames written."""
+    if "Relapse.Status" not in results.columns:
+        raise KeyError("Column 'Relapse.Status' is missing, run classify_relapse first.")
+
+    out_dir = Path(context["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{prefix}{product_slug(context['product'])}_{context['stamp']}.xlsx"
+
+    sheets = {
+        SHEET_ALL: results.loc[:, [c for c in RESULTS_TAB_COLUMNS if c in results.columns]],
+        SHEET_RELAPSE: build_relapse_tab(results),
+        SHEET_NO_RELAPSE: build_no_relapse_tab(results, match_keys=match_keys),
+    }
+
+    context = dict(context)
+    context["output_file"] = path
+    context["takeaway"] = build_key_takeaway(sheets[SHEET_NO_RELAPSE])
+    context["sheet_shapes"] = {n: (len(f), len(f.columns)) for n, f in sheets.items()}
+    meta_rows = build_metadata(context)
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        # The cover sheet is created first so it lands as worksheet 1
+        meta_ws = writer.book.create_sheet(SHEET_META)
+        _write_metadata_sheet(meta_ws, f"Population Extrapolation, {context['product']}", meta_rows)
+
+        for sheet_name, frame in sheets.items():
+            frame = frame.reset_index(drop=True)
+            frame.to_excel(writer, sheet_name=sheet_name, index=False)
+            _autoformat_sheet(writer.sheets[sheet_name], frame,
+                              highlight_cols=[PASTE_COL] if sheet_name == SHEET_NO_RELAPSE else [])
+            if frame.empty:
+                warnings.warn(f"Worksheet '{sheet_name}' has no rows.")
+
+    return path, {SHEET_META: pd.DataFrame(meta_rows, columns=["Field", "Value"]), **sheets}
+
+
+# ================================================================================================
+# SECTION W2.15. ORCHESTRATOR
+# ================================================================================================
+#
+# `pop_extrap` resolves the product name and author, runs every step in order, writes the
+# workbook, and
+# returns the intermediate tables plus the four worksheet frames.
+
+def pop_extrap(wd, rfile, ifile, product_name=None, author_name=None, out_dir=None,
+               match_keys: list[str] | None = None,
+               classify_columns=("Group", "Name")) -> dict:
+    """Run Workflow 2 and export the 4 worksheet workbook."""
+    wd = Path(wd)
+    rpath, ipath = wd / rfile, wd / ifile
+    for p in (rpath, ipath):
+        if not p.exists():
+            raise FileNotFoundError(f"File not found: {p}")
+
+    # W2.3 to W2.5, inputs, parameters, births by cohort
+    params, births = load_input_workbook(ipath)
+    cfg = derive_parameters(params)
+    s_births, c_births = build_birth_cohorts(cfg, births)
+
+    # W2.6 to W2.8, results, parsing, reshape
+    raw = load_detailed_results(rpath)
+    res = format_results(raw)
+    wide = cast_results(res, cfg["n_bc"])
+
+    # The product comes from the results file, an explicit override is checked against it
+    found_product, model_group = extract_product_name(raw["Model Group"])
+    if product_name:
+        if normalise_product(product_name) != normalise_product(found_product):
+            raise ValueError(
+                f"PRODUCT_NAME is {product_name!r} but 'Model Group' in {rpath.name} gives "
+                f"{found_product!r}. Set PRODUCT_NAME to None to use the file, or correct it.")
+        product = str(product_name).strip()      # the user's spelling wins once it matches
+    else:
+        product = found_product
+
+    # W2.9 to W2.11, extrapolation, totals, relapse label
+    res1 = extrapolate(s_births, wide, cfg["female_prop"], cfg["pop_size"])
+    final = classify_relapse(add_totals(res1), columns=classify_columns)
+
+    # W2.12 to W2.14, tabs, metadata and export
+    run_dt = datetime.now()
+    context = {
+        "author": author_name or extract_author(wd),
+        "run_dt": run_dt,
+        "stamp": run_dt.strftime("%d%b%Y_%H%M%S"),
+        "product": product,
+        "model_group": model_group,
+        "parameters": cfg,
+        "input_file": ipath,
+        "results_file": rpath,
+        "output_dir": Path(out_dir) if out_dir else wd,
+    }
+    path, sheets = export_pop_extrapolation(final, context, match_keys=match_keys)
+
+    print(f"File Saved: '{path.name}'")
+    print(f"Location  : {path.parent}")
+    print(f"Product   : {product}   (from Model Group '{model_group}')")
+    print(f"Author    : {context['author']}")
+    for name, frame in sheets.items():
+        print(f"  {name:<32} {len(frame):>4} row(s), {len(frame.columns)} column(s)")
+
+    return {"parameters": cfg, "births_by_year": c_births, "births_by_cohort": s_births,
+            "results_formatted": res, "results_wide": wide, "results_by_cohort": res1,
+            "results": final, "tabs": sheets, "product": product, "model_group": model_group,
+            "author": context["author"], "output_file": path}
+
+
+# ================================================================================================
+# SECTION W2.16. RUN WORKFLOW 2
+# ================================================================================================
+#
+# Close both Excel files first, a workbook open in Excel can lock the file and block the read.
+
+
+# ================================================================================================
+# SECTION W2.17. MOCK DATA TEST FOR WORKFLOW 2
+# ================================================================================================
+#
+# Builds both input workbooks from scratch, with the same tab names, column names and model
+# naming
+# convention as the real files, and runs Workflow 2 over them. It writes its own `Detailed
+# Results`
+# tab directly rather than calling anything from Workflow 1, so this section confirms that
+# Workflow 2
+# stands alone.
+
+W2_DEMO_PRODUCT = "Product_Name"     # stands in for the real product name
+
+
+def w2_build_mock_inputs(folder, n_cohorts: int = 11) -> Path:
+    """Write mock versions of both Workflow 2 input files."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(7)
+
+    # Input 1, parameters and births
+    params = pd.DataFrame({
+        "Name": ["Year of Cross-Section", "Start Age", "Age Category Width",
+                 "Number of Birth Cohorts", "Proportion of Population as Females",
+                 "Population Size", "Country"],
+        "Value": [2025, 15, 5, n_cohorts, 0.508, 100000, "United States"],
+    })
+    years = list(range(1900, 2026))
+    births = pd.DataFrame({"Country": ["United States"] * len(years), "Year": years,
+                           "Births": rng.integers(3_000_000, 4_500_000, len(years))})
+    with pd.ExcelWriter(folder / "MOCK_PopExtractionInputs_GT.xlsx") as xl:
+        params.to_excel(xl, sheet_name=PARAM_SHEET, index=False)
+        births.to_excel(xl, sheet_name=BIRTHS_SHEET, index=False)
+
+    # Input 2, the same shape Workflow 1 writes: one model group, two differently named arms
+    templates = {
+        "No Relapse": "Master Model {gw} " + W2_DEMO_PRODUCT + "_TwoAge_5a_6a_14b_15a_B{bc:02d}",
+        "Relapse": "Master Model {gw} " + W2_DEMO_PRODUCT + " Relapse_TwoAge_B{bc:02d}",
+    }
+    rows = []
+    for template in templates.values():
+        for gw in ("G10", "G25"):
+            for mm in ("JAGS_Male_2000", "JAGS_Female_2000"):
+                for err in (0.05, 0.1):
+                    for bc in range(1, n_cohorts + 1):
+                        rows.append({
+                            "Model Group": f"{W2_DEMO_PRODUCT} YO",
+                            "Model Name": template.format(gw=gw, bc=bc),
+                            "Mortality Model": mm,
+                            "ERR": err,
+                            "ERR Variability": "Variable",
+                            "TP Variability": "Smoking initiation and cessation variable",
+                            "Age Range": "68 - 72",
+                            "Node": "DIFF_ALL",
+                            "Mean_Webtool": float(rng.uniform(5, 2_700)),
+                            "Key": "",
+                            "Mean": float(rng.uniform(5, 2_700)),
+                            "QC": None,
+                        })
+    det = pd.DataFrame(rows)
+    stacked = pd.concat([pd.DataFrame([["Detailed Model Results"] + [None] * (det.shape[1] - 1)]),
+                         pd.DataFrame([det.columns.tolist()]),
+                         pd.DataFrame(det.values)], ignore_index=True)
+    with pd.ExcelWriter(folder / "MOCK_DetailedModelResults_Relapse_Calculations.xlsx") as xl:
+        stacked.to_excel(xl, sheet_name=RESULTS_SHEET, index=False, header=False)
+
+    return folder
+
+
+# ================================================================================================
+# TROUBLESHOOTING
+# ================================================================================================
+#
+# | Symptom | Workflow | Cause and fix |
+# |---|---|---|
+# | `The relapse and master pivot rows do not line up` | 1 | A gateway, stacked type, birth cohort, mortality model or ERR exists on one side only. The error prints the offending rows. |
+# | `N pivot row(s) exist on one side only` warning | 1 | A relapse model has no master counterpart or the reverse, so its calc columns are blank. Usually a missing webtool run. |
+# | `N relapse row(s) have no matching Relapse Key` | 1 | The `Relapse Key` built from model name, ERR and mortality model does not appear in the pivot. Check for a renamed model between the two blocks. |
+# | `The <pivot> has more than one row per [...]` | 1 | A model was run twice in the webtool, so the export holds replicates. Delete them and rerun. |
+# | Column `V` disagrees with `W`, `X`, `Y` in Excel | 1 | The source workbook's `V` column referenced the row below. Set `W1_REPLICATE_V_OFFSET = True` only if you need that original behaviour. |
+# | `Every 'Mean' value in 'Detailed Results' is empty` | 2 | The results file holds an uncalculated formula in that column. Open it in Excel, save, and rerun, or regenerate it with Workflow 1, which writes a value. |
+# | `PRODUCT_NAME is ... but 'Model Group' gives ...` | 2 | The override does not match the file, ignoring case and whitespace. Set `PRODUCT_NAME = None` to take the file's value. |
+# | Everything lands on one relapse level | 2 | The naming convention changed. Point the classifier elsewhere with `pop_extrap(..., classify_columns=("Name",))`, or change `RELAPSE_PATTERN`. |
+# | `More than one Relapse total shares the same [...]` | 2 | Two Relapse models collapse onto the same match key. Rerun with `match_keys=[..., "Name"]`. |
+# | `No Relapse to Relapse match found on 'Group', retrying` warning | 2 | The relapse models sit in a different model group. The fallback handled it, no action needed unless the retry also came up empty. |
+# | `Births missing for N year(s)` warning | 2 | The `Births` tab does not cover every year implied by the age range. Cohort totals are understated until those years are added. |
+# | Author or product reads wrong on the cover sheet | 2 | Set `AUTHOR_NAME` or `PRODUCT_NAME` in Section W2.1 rather than relying on the path and the file. |
+# | `Permission denied` when writing | 1 and 2 | An earlier output file with the same name is open in Excel. Close it and rerun. |
+
+
+# ================================================================================================
+# CONFIGURATION, THE DEFAULTS USED WHEN NOTHING IS PASSED ON THE COMMAND LINE
+# ================================================================================================
+#
+# These mirror the two configuration cells of the notebook. Keeping them as module level defaults
+# rather than hard coding them inside the functions means the module can be imported and driven
+# from another script without editing it, while a plain run still behaves like the notebook.
+
+# --- Workflow 1
+W1_WORKING_DIR = r"C:\Users\YemiOdeyemi\Downloads\Product_Name\Relapse Analysis"
+W1_INPUT_FILE = "DetailedModelResults_Grizzly_Relapse_Calculations.xlsx"
+W1_OUTPUT_FILE = "DetailedModelResults_Relapse_Calculations.xlsx"   # input 2 of Workflow 2
+W1_OUTPUT_DIR = None      # None writes next to the input
+
+# --- Workflow 2
+WORKING_DIR = r"C:\Users\YemiOdeyemi\Downloads\Product_Name\Relapse Analysis"
+
+INPUT_FILE = "PopExtractionInputs_GT.xlsx"                        # input 1, parameters and births
+RESULTS_FILE = "DetailedModelResults_Relapse_Calculations.xlsx"   # input 2, output of Workflow 1
+
+PRODUCT_NAME = None      # None extracts it from 'Model Group', or set e.g. "Product_Name"
+AUTHOR_NAME = None       # None extracts it from the working directory path
+OUTPUT_DIR = None        # None writes next to the inputs
+
+
+# ================================================================================================
+# ENTRY POINTS
+# ================================================================================================
+#
+# The notebook runs each workflow in a cell. A module must not do that on import, so the same
+# calls live here behind functions and a command line interface. `display()` is an IPython
+# builtin and is replaced by `print`, which is the only substantive difference.
+
+
+def run_workflow1(working_dir=None, infile=None, outfile=None, out_dir=None) -> dict:
+    """Run the relapse calculation and report the checks the notebook prints."""
+    result = relapse_calculations(
+        wd=working_dir or W1_WORKING_DIR,
+        infile=infile or W1_INPUT_FILE,
+        outfile=outfile or W1_OUTPUT_FILE,
+        out_dir=out_dir or W1_OUTPUT_DIR,
+    )
+
+    # The adjusted rows, the ones the XLOOKUP rewrites
+    adjusted = result["detailed_results"]
+    adjusted = adjusted.loc[
+        adjusted["Model Name"].str.contains(W1_RELAPSE_TOKEN, case=False, regex=False)]
+    print("\nAdjusted relapse rows (first 10):")
+    print(adjusted[["Model Name", "Mortality Model", "ERR", "Mean_Webtool", "Mean"]]
+          .head(10).to_string(index=False))
+
+    # Every check column must be True; this is the sheet's own alignment test
+    checks = ["Check Gateway", "Check StackedType", "Check Birth Cohort", "Check Mortality Model"]
+    aligned = bool(result["pivot_and_calcs"][checks].all().all())
+    print(f"\nRow alignment checks all True: {aligned}")
+    print(f"Pivot rows: {len(result['pivot_and_calcs'])} | "
+          f"Detail rows: {len(result['detailed_results'])}")
+    if not aligned:
+        raise SystemExit("Workflow 1: the relapse and master pivot rows do not line up.")
+    return result
+
+
+def run_workflow2(working_dir=None, rfile=None, ifile=None, product_name=None,
+                  author_name=None, out_dir=None) -> dict:
+    """Run the population extrapolation and report the checks the notebook prints."""
+    result = pop_extrap(
+        wd=working_dir or WORKING_DIR,
+        rfile=rfile or RESULTS_FILE,
+        ifile=ifile or INPUT_FILE,
+        product_name=product_name if product_name is not None else PRODUCT_NAME,
+        author_name=author_name if author_name is not None else AUTHOR_NAME,
+        out_dir=out_dir or OUTPUT_DIR,
+    )
+
+    print("\nMetadata cover sheet:")
+    print(result["tabs"][SHEET_META].to_string(index=False))
+
+    # Exactly two levels, and how the models split between them
+    print("\nRelapse.Status levels:", list(result["results"]["Relapse.Status"].cat.categories))
+    print(result["results"].groupby("Relapse.Status", observed=False)["Name"].unique().to_string())
+
+    # Delta must reconcile, and every No Relapse total should find a Relapse counterpart
+    chk = result["tabs"][SHEET_NO_RELAPSE]
+    if not (chk[NO_RELAPSE_MEAN_COL] - chk[RELAPSE_MEAN_COL]).equals(chk[DELTA_COL]):
+        raise SystemExit("Workflow 2: Delta does not reconcile.")
+    print(f"\nDelta reconciles for all {len(chk)} row(s), "
+          f"{int(chk[RELAPSE_MEAN_COL].isna().sum())} row(s) without a Relapse match")
+    return result
+
+
+# ================================================================================================
+# SELF TESTS
+# ================================================================================================
+#
+# The notebook's two mock data sections, lifted into functions. They write synthetic exports with
+# the same tab names, column names and model naming convention as the real files, run the workflow
+# over them and assert the result. They need no real export, so they are what to run first on a new
+# machine, and what a CI job runs on every commit.
+
+
+def self_test_workflow1() -> None:
+    """Build a mock DPM export, run Workflow 1 over it and check the calc columns."""
+    w1_mock_dir = Path.cwd() / "mock_workflow1"
+    w1_mock_path = w1_build_mock_source(w1_mock_dir)
+    w1_mock = relapse_calculations(w1_mock_dir, w1_mock_path.name, "MOCK_Relapse_Calculations.xlsx")
+
+    # Recompute the two calc columns from the mock source and compare
+    mock_src = w1_mock["source"]
+    mock_piv = w1_mock["pivot_and_calcs"]
+    expected_s = mock_piv[f"{W1_NODE_TOTAL}_m"] - mock_piv[W1_NODE_TOTAL]
+    expected_t = mock_piv[f"{W1_NODE_DIFF}_m"] - expected_s
+    assert np.allclose(mock_piv["(CF1-CF2)"], expected_s), "(CF1-CF2) does not reconcile"
+    assert np.allclose(mock_piv["CF1-BC1-CF1+CF2"], expected_t), "CF1-BC1-CF1+CF2 does not reconcile"
+
+    # The adjusted Mean must equal the T column for relapse rows and the webtool mean otherwise
+    mock_det = w1_mock["detailed_results"]
+    is_rel = mock_det["Model Name"].str.contains(W1_RELAPSE_TOKEN, case=False, regex=False)
+    lookup = dict(zip(mock_piv["Relapse Key"], mock_piv["CF1-BC1-CF1+CF2"]))
+    assert np.allclose(mock_det.loc[is_rel, "Mean"], mock_det.loc[is_rel, "Key"].map(lookup))
+    assert np.allclose(mock_det.loc[~is_rel, "Mean"], mock_det.loc[~is_rel, "Mean_Webtool"])
+
+    # And the written workbook must hold all three tabs
+    mock_tabs = load_workbook(w1_mock["output_file"]).sheetnames
+    print("\nMock workbook tabs:", mock_tabs)
+    print("Workflow 1 mock test passed:", len(mock_piv), "pivot rows,", len(mock_det), "detail rows")
+
+
+def self_test_workflow2() -> None:
+    """Build both mock inputs, run Workflow 2 over them and check the product extraction."""
+    w2_mock_dir = w2_build_mock_inputs(Path.cwd() / "mock_workflow2")
+    w2_mock = pop_extrap(w2_mock_dir,
+                         "MOCK_DetailedModelResults_Relapse_Calculations.xlsx",
+                         "MOCK_PopExtractionInputs_GT.xlsx")
+
+    # The product must come back out of 'Model Group' with the marker token trimmed
+    assert normalise_product(w2_mock["product"]) == normalise_product(W2_DEMO_PRODUCT)
+    print("\nProduct extracted:", w2_mock["product"], "| whitespace agnostic match:",
+          normalise_product("product name") == normalise_product("Product_Name"))
+
+    for sheet in [SHEET_META, SHEET_ALL, SHEET_RELAPSE, SHEET_NO_RELAPSE]:
+        frame = pd.read_excel(w2_mock["output_file"], sheet_name=sheet, header=None)
+        print(f"{sheet:<32} rows={len(frame):<4} cols={frame.shape[1]}")
+
+    w2_mock["tabs"][SHEET_NO_RELAPSE]
+
+
+def self_test() -> None:
+    """Run both self tests. Exits non zero on the first failed assertion."""
+    print("=" * 70)
+    print("SELF TEST, Workflow 1")
+    print("=" * 70)
+    self_test_workflow1()
+    print("\n" + "=" * 70)
+    print("SELF TEST, Workflow 2")
+    print("=" * 70)
+    self_test_workflow2()
+    print("\nBoth self tests passed.")
+
+
+# ================================================================================================
+# COMMAND LINE INTERFACE
+# ================================================================================================
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Relapse calculation and population extrapolation for the Dynamic Population "
+                    "Model.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--workflow", choices=["1", "2", "both"], default="both",
+                        help="1 = relapse calculation, 2 = population extrapolation")
+    parser.add_argument("--dir", dest="working_dir", default=None,
+                        help="folder holding the input workbooks, and where outputs are written")
+    parser.add_argument("--out-dir", default=None, help="write outputs somewhere else")
+    parser.add_argument("--relapse-input", default=None,
+                        help="Workflow 1 input, the DPM detailed results export")
+    parser.add_argument("--relapse-output", default=None,
+                        help="Workflow 1 output, which is input 2 of Workflow 2")
+    parser.add_argument("--params-input", default=None,
+                        help="Workflow 2 input 1, the parameters and births workbook")
+    parser.add_argument("--product", default=None,
+                        help="override the product name; by default it is read from Model Group")
+    parser.add_argument("--author", default=None,
+                        help="name for the metadata sheet; by default read from the path")
+    parser.add_argument("--self-test", action="store_true",
+                        help="run both self tests on mock data and exit")
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.self_test:
+        self_test()
+        return 0
+
+    if args.workflow in ("1", "both"):
+        print("=" * 70)
+        print("WORKFLOW 1, relapse calculation")
+        print("=" * 70)
+        run_workflow1(working_dir=args.working_dir, infile=args.relapse_input,
+                      outfile=args.relapse_output, out_dir=args.out_dir)
+
+    if args.workflow in ("2", "both"):
+        print("\n" + "=" * 70)
+        print("WORKFLOW 2, population extrapolation")
+        print("=" * 70)
+        run_workflow2(working_dir=args.working_dir, rfile=args.relapse_output,
+                      ifile=args.params_input, product_name=args.product,
+                      author_name=args.author, out_dir=args.out_dir)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

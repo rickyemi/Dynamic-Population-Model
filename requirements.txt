@@ -1,0 +1,17 @@
+# Dynamic Population Model, relapse calculation and population extrapolation
+#
+# Pinned to lower bounds rather than exact versions: the pipeline uses long-standing pandas and
+# openpyxl APIs, so exact pins would age badly, but the floors below are the versions the code was
+# developed and validated against. Install with:
+#
+#     pip install -r requirements.txt
+#
+# Python 3.11 or later is required (the code uses PEP 604 "X | None" annotations at runtime).
+
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1          # pandas uses it to read and write .xlsx, and the pipeline styles cells with it
+
+# Only needed to run or edit the notebook. The .py module in src/ does not import them.
+notebook>=7.0
+jupyterlab>=4.0
