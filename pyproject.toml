@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dpm"
+version = "3.0.0"
+description = "Dynamic Population Model analysis pipelines: relapse calculation, population extrapolation, tipping point plotting and dual use optimisation"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "YO" }]
+keywords = ["epidemiology", "excel-automation", "pandas", "openpyxl", "modelling"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Science/Research",
+    "Private :: Do Not Upload",          # guards against an accidental PyPI publish
+]
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "openpyxl>=3.1",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6", "nbformat>=5.10", "pre-commit>=3.7"]
+notebook = ["notebook>=7.0", "jupyterlab>=4.0"]
+
+[project.scripts]
+dpm = "dpm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    # The pipelines warn deliberately (missing births years, unmatched arms). Tests assert on
+    # behaviour, not on warning text, so warnings must not fail the run.
+    "default",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# The pipeline modules are generated from the notebooks, so lint findings there have to be fixed in
+# the notebook. They are excluded to keep the linter useful on hand-written code.
+extend-exclude = ["src/dpm/relapse_popextrapolation.py",
+                  "src/dpm/tipping_point_plotting.py",
+                  "src/dpm/dual_use_optimizer.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]   # line length is enforced by the formatter, not the linter
