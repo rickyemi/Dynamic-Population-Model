@@ -1,0 +1,27 @@
+# Copy to config/config.toml and edit. config.toml is gitignored, so your local paths never reach
+# the repository. Anything omitted falls back to the defaults inside the pipeline modules, and
+# anything passed on the command line overrides both.
+
+[paths]
+# Folder holding the model exports, and where outputs are written unless out_dir is set.
+# Relative paths here are resolved against the repository root, so "data/raw" works on any
+# machine. A path passed on the command line is relative to your current directory instead.
+data_dir = "data/raw"
+out_dir  = "data/processed"
+
+[run]
+# Leave author unset to take it from the account name in the path. Leave product unset to read it
+# from the Model Group column, which is the recommended way: it cannot then disagree with the data.
+author  = "YO"
+# product = "Grizzly_XL"
+
+[relapse]
+# Workflow 1 input, and the workbook it writes, which is input 2 of Workflow 2.
+input_file  = "DetailedModelResults_Grizzly_Relapse_Calculations.xlsx"
+output_file = "DetailedModelResults_Relapse_Calculations.xlsx"
+# Workflow 2 input 1.
+params_file = "PopExtractionInputs_GT.xlsx"
+
+[dual_use]
+# Leave unset to pick up the single file matching the required naming convention in data_dir.
+# input_file = "Dual_Use_Calculations_TwoAge_B01_Grizzly_XL_August_31_2026.xlsx"

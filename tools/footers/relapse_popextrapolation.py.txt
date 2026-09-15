@@ -1,0 +1,93 @@
+# ================================================================================================
+# ENTRY POINTS
+# ================================================================================================
+#
+# The notebook runs each workflow in a cell. A module must not do that on import, so the same calls
+# live here behind functions. `display()` is an IPython builtin and becomes `print`, which is the
+# only substantive difference between these and the notebook cells they came from.
+
+
+def run_workflow1(working_dir=None, infile=None, outfile=None, out_dir=None,
+                  verbose: bool = True) -> dict:
+    """Run the relapse calculation and check the pivot blocks stayed aligned."""
+    result = relapse_calculations(
+        wd=working_dir or W1_WORKING_DIR,
+        infile=infile or W1_INPUT_FILE,
+        outfile=outfile or W1_OUTPUT_FILE,
+        out_dir=out_dir or W1_OUTPUT_DIR,
+    )
+
+    adjusted = result["detailed_results"]
+    adjusted = adjusted.loc[
+        adjusted["Model Name"].str.contains(W1_RELAPSE_TOKEN, case=False, regex=False)]
+
+    # Every check column must be True; this is the sheet's own row alignment test, and a failure
+    # here means the two pivot blocks are off by a row, which no visual inspection would catch.
+    checks = ["Check Gateway", "Check StackedType", "Check Birth Cohort", "Check Mortality Model"]
+    aligned = bool(result["pivot_and_calcs"][checks].all().all())
+
+    if verbose:
+        print("\nAdjusted relapse rows (first 10):")
+        print(adjusted[["Model Name", "Mortality Model", "ERR", "Mean_Webtool", "Mean"]]
+              .head(10).to_string(index=False))
+        print(f"\nRow alignment checks all True: {aligned}")
+        print(f"Pivot rows: {len(result['pivot_and_calcs'])} | "
+              f"Detail rows: {len(result['detailed_results'])}")
+    if not aligned:
+        raise ValueError("Workflow 1: the relapse and master pivot rows do not line up.")
+    return result
+
+
+def run_workflow2(working_dir=None, rfile=None, ifile=None, product_name=None,
+                  author_name=None, out_dir=None, verbose: bool = True) -> dict:
+    """Run the population extrapolation and check the comparison columns reconcile."""
+    result = pop_extrap(
+        wd=working_dir or WORKING_DIR,
+        rfile=rfile or RESULTS_FILE,
+        ifile=ifile or INPUT_FILE,
+        product_name=product_name if product_name is not None else PRODUCT_NAME,
+        author_name=author_name if author_name is not None else AUTHOR_NAME,
+        out_dir=out_dir or OUTPUT_DIR,
+    )
+
+    chk = result["tabs"][SHEET_NO_RELAPSE]
+    if not (chk[NO_RELAPSE_MEAN_COL] - chk[RELAPSE_MEAN_COL]).equals(chk[DELTA_COL]):
+        raise ValueError("Workflow 2: Delta does not reconcile with the two mean columns.")
+
+    if verbose:
+        print("\nMetadata cover sheet:")
+        print(result["tabs"][SHEET_META].to_string(index=False))
+        print("\nRelapse.Status levels:",
+              list(result["results"]["Relapse.Status"].cat.categories))
+        print(f"\nDelta reconciles for all {len(chk)} row(s), "
+              f"{int(chk[RELAPSE_MEAN_COL].isna().sum())} row(s) without a Relapse match")
+    return result
+
+
+# ================================================================================================
+# SELF TESTS
+# ================================================================================================
+#
+# The notebook's two mock data sections, lifted into functions. They write synthetic exports with
+# the same tab names, column names and model naming convention as the real files, run the workflow
+# over them and assert the result. They need no real export, so this is what to run first on a new
+# machine and what CI runs on every commit.
+
+
+def self_test_workflow1() -> None:
+    """Build a mock DPM export, run Workflow 1 over it and check the calc columns."""
+{{SPLIT_21}}
+
+
+def self_test_workflow2() -> None:
+    """Build both mock inputs, run Workflow 2 over them and check the product extraction."""
+{{SPLIT_58}}
+
+
+def self_test() -> None:
+    """Run both self tests. Raises on the first failed assertion."""
+    print("=" * 70, "\nSELF TEST, Workflow 1\n", "=" * 70, sep="")
+    self_test_workflow1()
+    print("\n" + "=" * 70, "\nSELF TEST, Workflow 2\n", "=" * 70, sep="")
+    self_test_workflow2()
+    print("\nBoth self tests passed.")

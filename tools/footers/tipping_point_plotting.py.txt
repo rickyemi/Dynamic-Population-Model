@@ -1,0 +1,194 @@
+# ================================================================================================
+# ENTRY POINTS
+# ================================================================================================
+#
+# The notebook runs the pipeline, prints the takeaways, exports the bundle and validates in four
+# separate cells. Here they are one call, so nothing can be run out of order or skipped.
+
+
+def run_analysis(data_dir=None, out_dir=None, author=None, pdf_name=None,
+                 export: bool = True, validate: bool = True, verbose: bool = True) -> dict:
+    """Run the whole pipeline: resolve inputs, calculate, plot, report, export, validate."""
+    result = run_pipeline(data_dir=data_dir, out_dir=out_dir, author=author, pdf_name=pdf_name)
+
+    if verbose:
+        print("\nMean tipping points (%):")
+        print(result["qc"].query("Statistic == 'Mean'")[
+                  ["Transition", "Gateway", "ERR", "TippingPoint"]].to_string(index=False))
+        for subq in FIGURE_ORDER:
+            if subq not in set(result["dat"]["SubQ"]):
+                continue
+            print(f"\n=== Figure {FIGURE_NUMBERS[subq]}, {TRANSITIONS[subq]} ({subq}) ===")
+            for line in build_key_takeaways(subq, result["dat"], result["tps"], result["mm_init"]):
+                print(textwrap.fill(line, 110, initial_indent="  ", subsequent_indent="     "))
+
+    if export:
+        result["export_dir"] = export_outputs(result)
+    if validate:
+        validate_run(result, result.get("export_dir"))
+    return result
+
+
+def validate_run(result: dict, export_dir=None) -> None:
+    """Assert the run is internally consistent and every promised file exists.
+
+    A pipeline that runs is not the same as one that is right. These are the checks that would
+    otherwise fail silently: a filter that dropped a whole sub question, a tipping point that does
+    not sit between the two probabilities it was interpolated from, a figure written empty because
+    it was closed before saving.
+    """
+    qc, dat, tps = result["qc"], result["dat"], result["tps"]
+    n_facets = len(_facet_order(dat))
+
+    # 1. Coverage. Every sub question, gateway, RERR and statistic present exactly once.
+    expected_rows = len(set(dat["SubQ"])) * n_facets * 3
+    assert len(qc) == expected_rows, f"QC table has {len(qc)} rows, expected {expected_rows}"
+    assert not qc.duplicated(subset=["SubQ", "Gateway", "ERR", "Statistic"]).any()
+
+    # 2. Numeric tipping points inside their sweep; out of range labels pinned to the right end.
+    for _, row in tps.iterrows():
+        if isinstance(row["Result"], str):
+            end = row["SweepMax"] if row["Result"].startswith(">") else row["SweepMin"]
+            assert np.isclose(row["x_pos"], end), \
+                f"{row['Key']} {row['DataType']} pinned to the wrong end"
+        else:
+            assert row["SweepMin"] <= row["Result"] <= row["SweepMax"], \
+                f"{row['Key']} {row['DataType']} tipping point is outside its sweep"
+
+    # 3. The interpolation itself: the mean curve must change sign across the crossing.
+    for key, g in dat[dat["DataType"] == "Mean"].groupby("Key"):
+        row = tps[(tps["Key"] == key) & (tps["DataType"] == "Mean")].iloc[0]
+        if isinstance(row["Result"], str):
+            continue
+        g = g.sort_values("Probability")
+        below = g.loc[g["Probability"] <= row["Result"], "Result"]
+        above = g.loc[g["Probability"] >= row["Result"], "Result"]
+        assert len(below) and len(above), f"{key} has no points either side of its tipping point"
+        assert below.iloc[-1] * above.iloc[0] <= 0, f"{key} does not change sign at its crossing"
+
+    # 4. Every master model diamond joins to exactly one survivor value.
+    assert len(result["mm_init"]) == tps["Key"].nunique(), "A sweep is missing its master marker"
+    assert result["mm_init"]["MM.survivor"].notna().all()
+
+    # 5. Every promised file exists and is not empty.
+    for palette, paths in result["figures"].items():
+        assert len(paths) == len(FIGURE_ORDER) * 2, f"{palette}: expected 8 files"
+        assert all(p.exists() and p.stat().st_size > 0 for p in paths), f"{palette}: empty figure"
+    targets = [result["qc_file"], result["pdf_file"]]
+    if export_dir:
+        targets.append(Path(export_dir) / "MANIFEST.txt")
+    for path in targets:
+        assert Path(path).exists() and Path(path).stat().st_size > 0, f"Missing or empty: {path}"
+
+    print(f"All checks passed: {len(qc)} tipping points across {n_facets} panels and "
+          f"{len(set(dat['SubQ']))} transitions, "
+          f"{sum(len(v) for v in result['figures'].values())} figure files.")
+
+
+# ================================================================================================
+# SELF TEST
+# ================================================================================================
+#
+# Synthetic exports in the shape the real DPM writes, including the headerless upper bound of the
+# posterior interval pair, so `read_dpm` has to rename it by position exactly as it does on a real
+# file. The sweeps are built so that additional initiation crosses zero inside its range while the
+# other three do not, which exercises the numeric crossing and both out of range directions.
+
+SELF_TEST_PRODUCT = "Product_S"
+SELF_TEST_SWEEPS = {
+    "5a":  ("_2 AI", [round(0.02 * i, 4) for i in range(11)]),
+    "6a":  ("_2 DS", [round(0.05 * i, 4) for i in range(7)]),
+    "14b": ("_2 S",  [round(0.01 * i, 4) for i in range(6)]),
+    "15a": ("_2 DQ", [round(0.20 * i, 4) for i in range(6)]),
+}
+# (intercept, slope per unit probability): additional initiation falls through zero inside its
+# range; the other three stay on one side of it.
+SELF_TEST_CURVES = {"5a": (3300.0, -32000.0), "6a": (3300.0, 8000.0),
+                    "14b": (1050.0, 63000.0), "15a": (3370.0, -940.0)}
+
+
+def _self_test_row(group, name, sex, err, mean):
+    half = 0.09 * abs(mean) + 180.0
+    return {"Model Group": group, "Model Name": name, "Mortality Model": sex, "ERR": err,
+            "ERR Variability": "Variable",
+            "TP Variability": "Smoking initiation and cessation variable",
+            "Age Range": "68 - 72", "Node": "DIFF_ALL", "Mean": mean,
+            "95% PI": mean - half, "95% PI2": mean + half,
+            "Trans. Prob Stand. Dev.": 0.01, "ERR Standard Deviation": 0.01,
+            "QALE Mean": "N/A", "LE Mean": "N/A",
+            "Creation Date": pd.Timestamp("2026-09-02 09:57:04"),
+            "Web Version": "3.0.0", "R Version": "1.8"}
+
+
+def _write_self_test_workbook(frame: pd.DataFrame, path: Path) -> Path:
+    """Write in the DPM export shape: title row, header row, then data.
+
+    The 95% PI upper bound is written with a blank header, exactly as the DPM leaves it.
+    """
+    header = ["" if c == "95% PI2" else c for c in frame.columns]
+    stacked = pd.concat([pd.DataFrame([["Detailed Model Results"] + [None] * (frame.shape[1] - 1)]),
+                         pd.DataFrame([header]),
+                         pd.DataFrame(frame.values)], ignore_index=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path) as xl:
+        stacked.to_excel(xl, sheet_name=SHEET, index=False, header=False)
+    return path
+
+
+def build_self_test_inputs(folder) -> Path:
+    """Write both synthetic exports, named to the Requirement 1 convention."""
+    folder = Path(folder)
+    group = f"{SELF_TEST_PRODUCT} YO"                 # Requirement 3
+    sweeps, masters = [], []
+
+    for subq, (batch, probs) in SELF_TEST_SWEEPS.items():
+        intercept, slope = SELF_TEST_CURVES[subq]
+        for gw, gf in (("G10", 1.00), ("G25", 0.88)):
+            for sex, sf in (("JAGS_Male_2000", 1.00), ("JAGS_Female_2000", 0.85)):
+                for err, ef in ((0.05, 1.00), (0.10, 0.79)):
+                    for p in probs:
+                        name = f"Master Model {gw} {SELF_TEST_PRODUCT}{batch}_{subq}_{p:.2f}"
+                        sweeps.append(_self_test_row(
+                            group, name, sex, err, (intercept + slope * p) * gf * ef * sf))
+
+    for gw, gf in (("G10", 1.00), ("G25", 0.88)):
+        for sex, sf in (("JAGS_Male_2000", 1.00), ("JAGS_Female_2000", 0.85)):
+            for err, ef in ((0.05, 1.00), (0.10, 0.79)):
+                name = f"Master Model {gw} {SELF_TEST_PRODUCT} YO_TwoAge_5a_6a_14b_15a_B01"
+                masters.append(_self_test_row(group, name, sex, err, 3315.0 * gf * ef * sf))
+
+    tag = SELF_TEST_PRODUCT
+    _write_self_test_workbook(pd.DataFrame(sweeps),
+                              folder / f"DetailedModelResults_{tag}_TippingPoint.xlsx")
+    _write_self_test_workbook(pd.DataFrame(masters),
+                              folder / f"DetailedModelResults_{tag}_MasterModels.xlsx")
+    return folder
+
+
+def self_test(folder=None) -> dict:
+    """Build synthetic exports, run the pipeline over them and assert the known answers."""
+    folder = Path(folder or Path.cwd() / "self_test_tipping_point")
+    build_self_test_inputs(folder)
+    result = run_analysis(data_dir=folder, out_dir=folder / "output", author="Self test",
+                          verbose=False)
+
+    qc = result["qc"]
+    assert len(qc) == 4 * 2 * 2 * 3, "expected 4 transitions x 2 gateways x 2 RERRs x 3 statistics"
+
+    # Additional initiation must cross inside its range, at the intercept over the slope
+    add_init = qc.query("SubQ == '5a' and Statistic == 'Mean'")["TippingPoint"]
+    expected = 100 * (SELF_TEST_CURVES["5a"][0] / -SELF_TEST_CURVES["5a"][1])
+    assert add_init.map(lambda v: not isinstance(v, str)).all(), "5a should cross inside the range"
+    assert np.allclose(add_init.astype(float), expected, atol=0.05), \
+        f"5a mean tipping point should be about {expected:.2f}%"
+
+    # A rising, always positive curve crosses below the smallest swept probability, and a falling
+    # one above the largest. Getting this backwards was the main defect in the legacy R script.
+    assert qc.query("SubQ in ['6a', '14b'] and Statistic == 'Mean'")["TippingPoint"].map(
+        lambda v: isinstance(v, str) and v.startswith("<")).all()
+    assert qc.query("SubQ == '15a' and Statistic == 'Mean'")["TippingPoint"].map(
+        lambda v: isinstance(v, str) and v.startswith(">")).all()
+
+    print(f"Self test passed: expected 5a tipping point {expected:.2f}%, got "
+          f"{sorted(set(np.round(add_init.astype(float), 2)))}.")
+    return result
